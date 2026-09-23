@@ -38,6 +38,26 @@ use crate::utf8::IncrementalUtf8Decoder;
 const READ_BUFFER_BYTES: usize = 32 * 1024;
 /// 退出后等读取线程排空残余输出的上限。
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
+/// 防止异常 create/resize 请求让 VT 网格一次分配数十 GB。
+/// 常见终端尺寸远低于此；1024 列的 5000 行历史本身仍可能达到约 160 MiB。
+pub const MAX_COLS: u16 = 1024;
+pub const MAX_ROWS: u16 = 512;
+// Server 可独立钳制到 1000x500；此上限必须覆盖它的整个合法范围。
+pub const MAX_GRID_CELLS: u32 = 500_000;
+
+pub(crate) fn validate_size(cols: u16, rows: u16) -> Result<(), RenderError> {
+  if cols == 0
+    || rows == 0
+    || cols > MAX_COLS
+    || rows > MAX_ROWS
+    || u32::from(cols) * u32::from(rows) > MAX_GRID_CELLS
+  {
+    return Err(RenderError::BadRequest(format!(
+      "invalid terminal size {cols}x{rows}; limits are {MAX_COLS} cols, {MAX_ROWS} rows, {MAX_GRID_CELLS} cells"
+    )));
+  }
+  Ok(())
+}
 
 /// 取锁时把「中毒」当成正常状态：会话数据本身没有跨会话不变量，
 /// 一个 panic 过的线程不该让其它会话的 attach 全部失败。
@@ -57,6 +77,10 @@ struct Inner {
   /// 上一次 checkpoint 拍下的基线屏幕。**冻结**：它只反映 checkpoint 那一刻的屏幕，
   /// 之后的操作走 `pending`（协议要求「先写 data，再按序重放 pending」）。
   baseline: TerminalSnapshot,
+  /// 上一次基线中的普通屏历史行数。备用屏期间仍保留最近一次普通屏的估值。
+  scrollback_rows: usize,
+  max_cols_seen: u16,
+  max_rows_seen: u16,
   pending: Vec<PendingOp>,
   pending_chars: usize,
   snapshot_dirty: bool,
@@ -76,7 +100,12 @@ impl Inner {
   /// 重放会写两遍）；同时基线之后新到的操作会继续进 pending，保证
   /// 「baseline + pending == 当前屏幕」在任何时刻都成立 —— 这是重连不丢输出的前提。
   fn checkpoint(&mut self) {
-    self.baseline = snapshot::build_baseline(self.parser.screen(), self.modes.autowrap());
+    let (baseline, history_rows) =
+      snapshot::build_baseline_with_history(self.parser.screen(), self.modes.autowrap());
+    self.baseline = baseline;
+    if !self.parser.screen().alternate_screen() {
+      self.scrollback_rows = history_rows;
+    }
     self.pending.clear();
     self.pending_chars = 0;
     self.snapshot_dirty = false;
@@ -98,6 +127,29 @@ impl Inner {
       }),
     }
     self.pending_chars += data.chars().count();
+  }
+
+  /// 保留数据的近似字节数。VT 网格按 vt100 Cell 的真实大小、已知历史行数和
+  /// 历史最大宽高保守估算；库不暴露 Vec 的容量，因此不承诺与 RSS 精确相等。
+  fn live_bytes(&self) -> u64 {
+    let grid_rows = self.scrollback_rows + usize::from(self.max_rows_seen) * 2;
+    let grid = grid_rows
+      .saturating_mul(usize::from(self.max_cols_seen))
+      .saturating_mul(std::mem::size_of::<vt100::Cell>());
+    let pending = self.pending.capacity() * std::mem::size_of::<PendingOp>()
+      + self
+        .pending
+        .iter()
+        .map(|op| match op {
+          PendingOp::Data { data } => data.capacity(),
+          PendingOp::Resize { .. } => 0,
+        })
+        .sum::<usize>();
+    (self.output.allocated_bytes()
+      + self.chunks.allocated_bytes()
+      + self.baseline.data.capacity()
+      + pending
+      + grid) as u64
   }
 }
 
@@ -131,12 +183,7 @@ impl Session {
     if params.file.is_empty() {
       return Err(RenderError::BadRequest("file is required".into()));
     }
-    if params.cols == 0 || params.rows == 0 {
-      return Err(RenderError::BadRequest(format!(
-        "invalid terminal size {}x{}",
-        params.cols, params.rows
-      )));
-    }
+    validate_size(params.cols, params.rows)?;
     // cwd 不存在时必须报错，而不是像 portable-pty 那样静默回落到 HOME。
     if !params.cwd.is_empty() && !Path::new(&params.cwd).is_dir() {
       return Err(RenderError::BadRequest(format!(
@@ -226,6 +273,9 @@ impl Session {
         rows: params.rows,
         pending: Vec::new(),
       },
+      scrollback_rows: 0,
+      max_cols_seen: params.cols,
+      max_rows_seen: params.rows,
       pending: Vec::new(),
       pending_chars: 0,
       snapshot_dirty: true,
@@ -304,8 +354,7 @@ impl Session {
   }
 
   pub fn live_bytes(&self) -> u64 {
-    let inner = lock(&self.state);
-    (inner.output.bytes() + inner.chunks.bytes()) as u64
+    lock(&self.state).live_bytes()
   }
 
   pub fn write(&self, data: &str) -> Result<(), RenderError> {
@@ -330,11 +379,7 @@ impl Session {
   }
 
   pub fn resize(&self, cols: u16, rows: u16) -> Result<(), RenderError> {
-    if cols == 0 || rows == 0 {
-      return Err(RenderError::BadRequest(format!(
-        "invalid terminal size {cols}x{rows}"
-      )));
-    }
+    validate_size(cols, rows)?;
     {
       let mut inner = lock(&self.state);
       if inner.status != SessionStatus::Running {
@@ -345,6 +390,8 @@ impl Session {
       }
       inner.cols = cols;
       inner.rows = rows;
+      inner.max_cols_seen = inner.max_cols_seen.max(cols);
+      inner.max_rows_seen = inner.max_rows_seen.max(rows);
       inner.parser.screen_mut().set_size(rows, cols);
       inner.pending.push(PendingOp::Resize { cols, rows });
       // 尺寸变化会让旧基线失效：下一次静默窗口一定会重算。
@@ -673,6 +720,50 @@ mod tests {
     let second = new_incarnation_id();
     assert_ne!(first, second);
     assert!(first.starts_with("u-"));
+  }
+
+  #[test]
+  fn terminal_geometry_rejects_pathological_allocations() {
+    assert!(validate_size(80, 24).is_ok());
+    assert!(validate_size(1000, 500).is_ok());
+    assert!(matches!(validate_size(0, 24), Err(RenderError::BadRequest(_))));
+    assert!(matches!(validate_size(1025, 24), Err(RenderError::BadRequest(_))));
+    assert!(matches!(validate_size(1024, 500), Err(RenderError::BadRequest(_))));
+  }
+
+  #[test]
+  fn live_bytes_covers_screen_and_pending_memory() {
+    let mut inner = Inner {
+      status: SessionStatus::Running,
+      exit_code: None,
+      cols: 80,
+      rows: 24,
+      seq: 0,
+      output: TextWindow::new(PTY_OUTPUT_MAX_CHARS),
+      chunks: ChunkWindow::new(PTY_OUTPUT_MAX_CHARS),
+      parser: Parser::new(24, 80, SCROLLBACK_LINES),
+      baseline: TerminalSnapshot {
+        version: snapshot::VERSION,
+        data: String::new(),
+        cols: 80,
+        rows: 24,
+        pending: Vec::new(),
+      },
+      scrollback_rows: 0,
+      max_cols_seen: 80,
+      max_rows_seen: 24,
+      pending: Vec::new(),
+      pending_chars: 0,
+      snapshot_dirty: true,
+      last_write_at: None,
+      marker: None,
+      modes: DecModeTracker::new(),
+    };
+    inner.checkpoint();
+    let baseline_bytes = inner.live_bytes();
+    assert!(baseline_bytes >= 80 * 24 * 2 * std::mem::size_of::<vt100::Cell>() as u64);
+    inner.push_pending("some pending output");
+    assert!(inner.live_bytes() > baseline_bytes);
   }
 
   #[test]

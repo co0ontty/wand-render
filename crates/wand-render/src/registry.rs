@@ -15,14 +15,43 @@ use wand_render_protocol::{
 };
 
 use crate::error::RenderError;
-use crate::resources::rss_bytes;
-use crate::session::Session;
+use crate::resources::{admission_budget_bytes, rss_bytes};
+use crate::session::{validate_size, Session};
 use crate::sink::EventSink;
 use crate::snapshot;
 use crate::time::iso8601_now;
 
 /// 快照维护线程的轮询间隔（远小于 100ms 静默窗口，保证及时固化基线）。
 const MAINTENANCE_INTERVAL: Duration = Duration::from_millis(20);
+/// 与 Server 的会话上限一致，只计正在运行的 PTY；已退出记录由 Server 决定何时 forget。
+const MAX_RUNNING_SESSIONS: usize = 200;
+/// 新 PTY 的初始屏幕及启动阶段输出预留；运行后内存仍可能继续增长。
+const NEW_SESSION_HEADROOM_BYTES: u64 = 1024 * 1024;
+
+fn new_session_reserve_bytes(cols: u16, rows: u16) -> u64 {
+  u64::from(cols) * u64::from(rows) * 2 * std::mem::size_of::<vt100::Cell>() as u64
+    + NEW_SESSION_HEADROOM_BYTES
+}
+
+fn check_admission(
+  running_count: usize,
+  live_bytes: u64,
+  budget: u64,
+  cols: u16,
+  rows: u16,
+) -> Result<(), RenderError> {
+  if running_count >= MAX_RUNNING_SESSIONS {
+    return Err(RenderError::Conflict(format!(
+      "render running session limit ({MAX_RUNNING_SESSIONS}) reached"
+    )));
+  }
+  if live_bytes.saturating_add(new_session_reserve_bytes(cols, rows)) > budget {
+    return Err(RenderError::Conflict(format!(
+      "render memory admission budget exceeded: approximately {live_bytes} retained bytes, budget {budget} bytes"
+    )));
+  }
+  Ok(())
+}
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
   mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -30,6 +59,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct RenderRegistry {
   sessions: Mutex<HashMap<String, Arc<Session>>>,
+  /// 串行化新 PTY 的预算检查与 spawn；attach 不需要持有此锁。
+  admission: Mutex<()>,
   sink: Arc<dyn EventSink>,
   version: String,
   started_at: Instant,
@@ -43,6 +74,7 @@ impl RenderRegistry {
   pub fn new(version: impl Into<String>, sink: Arc<dyn EventSink>) -> Arc<Self> {
     let registry = Arc::new(Self {
       sessions: Mutex::new(HashMap::new()),
+      admission: Mutex::new(()),
       sink,
       version: version.into(),
       started_at: Instant::now(),
@@ -99,11 +131,28 @@ impl RenderRegistry {
         is_new: false,
       });
     }
+    let _admission = lock(&self.admission);
     if self.shutting_down.load(Ordering::SeqCst) {
       return Err(RenderError::Conflict(
         "render is shutting down; refusing to create new sessions".into(),
       ));
     }
+    // 第一轮查找之后可能有另一个 createOrAttach 完成；不要为同一 ID 多建 PTY。
+    let concurrent_existing = lock(&self.sessions).get(&params.session_id).cloned();
+    if let Some(existing) = concurrent_existing {
+      return Ok(CreateOrAttachResult {
+        state: existing.state(params.after_seq),
+        is_new: false,
+      });
+    }
+    validate_size(params.cols, params.rows)?;
+    let all: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
+    let live_bytes = all
+      .iter()
+      .fold(0u64, |total, session| total.saturating_add(session.live_bytes()));
+    let budget = admission_budget_bytes();
+    let running_count = all.iter().filter(|session| session.is_running()).count();
+    check_admission(running_count, live_bytes, budget, params.cols, params.rows)?;
     // 先建 PTY 再登记：spawn 失败时不会留下半截记录。
     let session = Session::spawn(params, Arc::clone(&self.sink))?;
     let mut sessions = lock(&self.sessions);
@@ -223,6 +272,7 @@ impl RenderRegistry {
   /// `drain`：停止接受新会话、释放已退出会话，**运行中的 PTY 一律不杀**。
   /// `now`：杀掉所有 PTY（只在用户明确要求时使用）。
   pub fn begin_shutdown(&self, mode: ShutdownMode) {
+    let _admission = lock(&self.admission);
     self.shutting_down.store(true, Ordering::SeqCst);
     match mode {
       ShutdownMode::Drain => {
@@ -276,6 +326,42 @@ impl RenderRegistry {
 mod tests {
   use super::*;
   use crate::sink::NullSink;
+
+  #[test]
+  fn new_session_reserve_tracks_geometry() {
+    let small = new_session_reserve_bytes(80, 24);
+    let large = new_session_reserve_bytes(160, 48);
+    assert!(small > NEW_SESSION_HEADROOM_BYTES);
+    assert!(large > small);
+    assert!(large < 3 * 1024 * 1024);
+  }
+
+  #[test]
+  fn admission_checks_budget_and_running_session_count() {
+    let reserve = new_session_reserve_bytes(80, 24);
+    assert!(check_admission(199, 0, reserve, 80, 24).is_ok());
+    assert!(matches!(
+      check_admission(200, 0, reserve, 80, 24),
+      Err(RenderError::Conflict(_))
+    ));
+    assert!(matches!(
+      check_admission(0, 1, reserve, 80, 24),
+      Err(RenderError::Conflict(_))
+    ));
+  }
+
+  #[test]
+  fn oversized_create_request_fails_before_spawning() {
+    let registry = RenderRegistry::new("test", Arc::new(NullSink));
+    let mut request = params("oversized");
+    request.cols = 2048;
+    assert!(matches!(
+      registry.create_or_attach(&request),
+      Err(RenderError::BadRequest(_))
+    ));
+    assert_eq!(registry.session_count(), 0);
+    registry.stop_maintenance();
+  }
 
   #[test]
   fn hello_reports_protocol_version_and_started_at() {

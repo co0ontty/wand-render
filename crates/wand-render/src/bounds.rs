@@ -89,6 +89,11 @@ impl TextWindow {
     self.segments.iter().map(String::len).sum()
   }
 
+  pub fn allocated_bytes(&self) -> usize {
+    self.segments.capacity() * std::mem::size_of::<String>()
+      + self.segments.iter().map(String::capacity).sum::<usize>()
+  }
+
   pub fn to_string_value(&self) -> String {
     let mut joined = String::with_capacity(self.bytes());
     for segment in &self.segments {
@@ -142,6 +147,11 @@ impl ChunkWindow {
 
   pub fn bytes(&self) -> usize {
     self.entries.iter().map(|(_, data)| data.len()).sum()
+  }
+
+  pub fn allocated_bytes(&self) -> usize {
+    self.entries.capacity() * std::mem::size_of::<(u64, String)>()
+      + self.entries.iter().map(|(_, data)| data.capacity()).sum::<usize>()
   }
 
   pub fn iter(&self) -> impl Iterator<Item = (u64, &str)> {

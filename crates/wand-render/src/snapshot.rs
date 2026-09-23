@@ -24,13 +24,29 @@ pub fn build_baseline(screen: &Screen, autowrap: bool) -> TerminalSnapshot {
   build(screen, Vec::new(), autowrap)
 }
 
+/// 维护线程在生成基线时顺便取得历史行数，供内存估算使用。
+/// `vt100::Screen` 没有直接暴露历史行数；生成快照本来就要克隆一次屏幕。
+pub fn build_baseline_with_history(screen: &Screen, autowrap: bool) -> (TerminalSnapshot, usize) {
+  build_with_history(screen, Vec::new(), autowrap)
+}
+
 /// 生成快照。`pending` 是基线之后的 data/resize 序列，按序重放即可回到当前屏幕。
 pub fn build(screen: &Screen, pending: Vec<PendingOp>, autowrap: bool) -> TerminalSnapshot {
+  build_with_history(screen, pending, autowrap).0
+}
+
+fn build_with_history(
+  screen: &Screen,
+  pending: Vec<PendingOp>,
+  autowrap: bool,
+) -> (TerminalSnapshot, usize) {
   let (rows, cols) = screen.size();
   let mut data: Vec<u8> = Vec::new();
-  if !screen.alternate_screen() {
-    write_scrollback(&mut data, screen, cols);
-  }
+  let history_rows = if screen.alternate_screen() {
+    0
+  } else {
+    write_scrollback(&mut data, screen, cols)
+  };
   data.extend_from_slice(if screen.alternate_screen() {
     b"\x1b[?1049h"
   } else {
@@ -42,14 +58,15 @@ pub fn build(screen: &Screen, pending: Vec<PendingOp>, autowrap: bool) -> Termin
   data.extend_from_slice(&screen.input_mode_formatted());
   data.extend_from_slice(if autowrap { b"\x1b[?7h" } else { b"\x1b[?7l" });
 
-  TerminalSnapshot {
+  let snapshot = TerminalSnapshot {
     version: VERSION,
     // 屏幕内容只会由合法 UTF-8 构造出来（PTY 解码器已经丢掉非法字节）。
     data: String::from_utf8_lossy(&data).into_owned(),
     cols,
     rows,
     pending,
-  }
+  };
+  (snapshot, history_rows)
 }
 
 /// `list` 返回的单个快照上限（协议 §9.1.1）：序列化后必须 ≤ 64KiB。
@@ -188,13 +205,13 @@ fn escape_end(bytes: &[u8]) -> Option<usize> {
 ///
 /// 在 `Screen` 的克隆上挪动 scrollback 偏移，避免动到正在被写入的屏幕；
 /// 每行照 legacy 的换行规则输出（软换行的续行不再补 `\r\n`）。
-fn write_scrollback(data: &mut Vec<u8>, screen: &Screen, cols: u16) {
+fn write_scrollback(data: &mut Vec<u8>, screen: &Screen, cols: u16) -> usize {
   let mut view = screen.clone();
   // `set_scrollback` 会 clamp 到真实历史长度，于是能反查总行数。
   view.set_scrollback(usize::MAX);
   let total = view.scrollback();
   if total == 0 {
-    return;
+    return 0;
   }
   let start = total.saturating_sub(SCROLLBACK_LINES);
   for offset in (start + 1..=total).rev() {
@@ -207,6 +224,7 @@ fn write_scrollback(data: &mut Vec<u8>, screen: &Screen, cols: u16) {
       data.extend_from_slice(b"\r\n");
     }
   }
+  total
 }
 
 /// DEC 私有模式跟踪。目前只关心 DECAWM(`?7`)，因为 vt100 不保存它，
@@ -337,6 +355,15 @@ fn parse_dec_private_mode(bytes: &[u8]) -> DecScan {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn baseline_reports_retained_history_rows() {
+    let mut parser = vt100::Parser::new(2, 4, 5);
+    parser.process(b"a\r\nb\r\nc\r\n");
+    let (snapshot, history_rows) = build_baseline_with_history(parser.screen(), true);
+    assert!(history_rows > 0 && history_rows <= 5);
+    assert!(!snapshot.data.is_empty());
+  }
   use vt100::Parser;
 
   const ROWS: u16 = 10;
