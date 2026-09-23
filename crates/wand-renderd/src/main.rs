@@ -104,7 +104,7 @@ fn serve(config_path: &Path) -> Result<()> {
     .with_context(|| format!("failed to create {}", paths.config_dir().display()))?;
 
   // 3. 单实例：socket 还能连上就绝不抢；路径不属于本用户时拒绝启动（协议 §9.5.2）。
-  prepare_socket_path(&paths.socket_path)?;
+  prepare_socket_path(&paths)?;
 
   let listener = UnixListener::bind(&paths.socket_path)
     .with_context(|| format!("failed to bind {}", paths.socket_path.display()))?;
@@ -218,10 +218,19 @@ fn shutdown_loop(registry: &RenderRegistry, requests: &Receiver<ShutdownMode>) -
 /// - 其他任何情况（普通文件、符号链接、别人的 socket、权限过宽）→ **拒绝启动**，
 ///   绝不 unlink 不属于自己的路径。
 #[cfg(unix)]
-fn prepare_socket_path(socket_path: &Path) -> Result<()> {
+fn prepare_socket_path(paths: &RenderPaths) -> Result<()> {
+  let socket_path = paths.socket_path.as_path();
   match security::inspect_socket_path(socket_path) {
     ExistingSocket::Absent => Ok(()),
     ExistingSocket::Owned => {
+      // pid 文件是 daemon 自己的权威存活记录：它先写 pid 再 bind，所以
+      // 「pid 活着」比「connect 能不能连上」更可靠（后者会与 close 竞争）。
+      if let Some(pid) = live_owner_pid(&paths.pid_path) {
+        return Err(anyhow!(
+          "another Render is already running (pid {pid}) on {}",
+          socket_path.display()
+        ));
+      }
       if socket_is_live(socket_path) {
         return Err(anyhow!(
           "another Render is already listening on {}",
@@ -329,19 +338,53 @@ fn create_pipe() -> Result<(libc::c_int, libc::c_int)> {
   Ok((fds[0], fds[1]))
 }
 
+/// 单次 connect 探测：能连上说明有进程在 listen，立即释放，绝不干扰它。
+#[cfg(unix)]
+fn probe_socket_once(socket_path: &Path) -> bool {
+  match std::os::unix::net::UnixStream::connect(socket_path) {
+    Ok(stream) => {
+      let _ = stream.shutdown(std::net::Shutdown::Both);
+      true
+    }
+    Err(_) => false,
+  }
+}
+
 /// socket 上还有活的 Render 吗？（陈旧 socket 文件会 connect 失败。）
+///
+/// 连接探活，**必须两次都成功**才判定为「有活的 Render」。
+/// 单次探测在这里不够：刚刚退出的 daemon 与我们的 connect 存在竞态 —— CI 上就真的遇到过
+/// 「监听器已 drop、文件还在，connect 却成功一次」，于是崩溃残留被误判成活着，
+/// 结果是新 daemon 拒绝启动、Server 回退 legacy。等一小会儿再探一次可以区分
+/// 「真的有进程在 listen」与「正在消失的残留」。
 #[cfg(unix)]
 fn socket_is_live(socket_path: &Path) -> bool {
   if !socket_path.exists() {
     return false;
   }
-  match std::os::unix::net::UnixStream::connect(socket_path) {
-    Ok(stream) => {
-      // 连上就说明有进程在 listen：立即释放，绝不干扰它。
-      let _ = stream.shutdown(std::net::Shutdown::Both);
-      true
-    }
-    Err(_) => false,
+  if !probe_socket_once(socket_path) {
+    return false;
+  }
+  std::thread::sleep(std::time::Duration::from_millis(50));
+  socket_path.exists() && probe_socket_once(socket_path)
+}
+
+/// 读取 pid 文件并确认进程还活着。pid 复用由「socket 路径属于本用户且是 0600」共同约束。
+#[cfg(unix)]
+fn live_owner_pid(pid_path: &Path) -> Option<u32> {
+  let raw = std::fs::read_to_string(pid_path).ok()?;
+  let pid: i32 = raw.trim().parse().ok()?;
+  if pid <= 0 {
+    return None;
+  }
+  // 只关心「存在且可发信号」，不发信号本身。
+  if unsafe { libc::kill(pid, 0) } == 0 {
+    return Some(pid as u32);
+  }
+  match std::io::Error::last_os_error().raw_os_error() {
+    // EPERM：进程存在但不是我们的（不会出现在本用户路径上，保守视为活着）。
+    Some(libc::EPERM) => Some(pid as u32),
+    _ => None,
   }
 }
 
@@ -408,9 +451,10 @@ mod tests {
   #[test]
   fn prepare_socket_path_refuses_foreign_paths_without_removing_them() {
     let dir = test_dir("foreign");
-    let path = dir.join("wand-render.sock");
+    let paths = test_paths(&dir);
+    let path = paths.socket_path.clone();
     std::fs::write(&path, b"someone else's file").expect("write");
-    let error = prepare_socket_path(&path).expect_err("a regular file must be refused");
+    let error = prepare_socket_path(&paths).expect_err("a regular file must be refused");
     assert!(
       error.to_string().contains("not a unix socket"),
       "unhelpful error: {error}"
@@ -422,24 +466,39 @@ mod tests {
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
     let link = dir.join("link.sock");
     std::os::unix::fs::symlink(&target, &link).expect("symlink");
-    assert!(prepare_socket_path(&link).is_err());
+    let link_paths = RenderPaths {
+      socket_path: link,
+      token_path: paths.token_path.clone(),
+      pid_path: paths.pid_path.clone(),
+      meta_path: paths.meta_path.clone(),
+    };
+    assert!(prepare_socket_path(&link_paths).is_err());
     drop(listener);
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  fn test_paths(dir: &Path) -> RenderPaths {
+    RenderPaths {
+      socket_path: dir.join("wand-render.sock"),
+      token_path: dir.join(".render.token"),
+      pid_path: dir.join(".render.pid"),
+      meta_path: dir.join(".render.json"),
+    }
   }
 
   /// 活得着的 Render 必须拒绝启动而不是抢 socket。
   #[test]
   fn prepare_socket_path_refuses_when_a_render_is_listening() {
     let dir = test_dir("live");
-    let path = dir.join("wand-render.sock");
-    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    let error = prepare_socket_path(&path).expect_err("a live listener must be respected");
+    let paths = test_paths(&dir);
+    let listener = std::os::unix::net::UnixListener::bind(&paths.socket_path).expect("bind");
+    std::fs::set_permissions(&paths.socket_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let error = prepare_socket_path(&paths).expect_err("a live listener must be respected");
     assert!(
       error.to_string().contains("already listening"),
       "unhelpful error: {error}"
     );
-    assert!(path.exists());
+    assert!(paths.socket_path.exists());
     drop(listener);
     let _ = std::fs::remove_dir_all(&dir);
   }
@@ -448,15 +507,58 @@ mod tests {
   #[test]
   fn prepare_socket_path_reclaims_a_stale_own_socket() {
     let dir = test_dir("stale");
-    let path = dir.join("wand-render.sock");
+    let paths = test_paths(&dir);
     {
-      let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
-      std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+      let listener = std::os::unix::net::UnixListener::bind(&paths.socket_path).expect("bind");
+      std::fs::set_permissions(&paths.socket_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
       drop(listener);
     }
-    assert!(path.exists(), "a dropped listener leaves the socket file behind");
-    prepare_socket_path(&path).expect("a stale own socket must be reclaimed");
-    assert!(!path.exists(), "the stale socket must be removed before bind");
+    assert!(
+      paths.socket_path.exists(),
+      "a dropped listener leaves the socket file behind"
+    );
+    prepare_socket_path(&paths).expect("a stale own socket must be reclaimed");
+    assert!(
+      !paths.socket_path.exists(),
+      "the stale socket must be removed before bind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// pid 文件里是一个死 pid：即使 socket 还在文件系统上，也应视为陈旧并回收。
+  #[test]
+  fn prepare_socket_path_reclaims_when_the_recorded_pid_is_dead() {
+    let dir = test_dir("dead-pid");
+    let paths = test_paths(&dir);
+    {
+      let listener = std::os::unix::net::UnixListener::bind(&paths.socket_path).expect("bind");
+      std::fs::set_permissions(&paths.socket_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+      drop(listener);
+    }
+    // 一个几乎不可能存在的 pid：确认「死 pid」不会阻止回收。
+    std::fs::write(&paths.pid_path, "999999\n").expect("write pid");
+    assert_eq!(live_owner_pid(&paths.pid_path), None);
+    prepare_socket_path(&paths).expect("a dead owner must not block a restart");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// pid 文件里是活着的 pid（这里用测试进程自己）：必须拒绝启动，
+  /// 且错误信息要说清是「有进程在跑」，而不是含糊的「连不上」。
+  #[test]
+  fn prepare_socket_path_refuses_when_the_recorded_pid_is_alive() {
+    let dir = test_dir("live-pid");
+    let paths = test_paths(&dir);
+    {
+      let listener = std::os::unix::net::UnixListener::bind(&paths.socket_path).expect("bind");
+      std::fs::set_permissions(&paths.socket_path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+      drop(listener);
+    }
+    std::fs::write(&paths.pid_path, format!("{}\n", std::process::id())).expect("write pid");
+    let error = prepare_socket_path(&paths).expect_err("a live owner must be respected");
+    assert!(
+      error.to_string().contains("already running"),
+      "unhelpful error: {error}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
   }
 
