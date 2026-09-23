@@ -5,6 +5,10 @@
 
 use serde::{Deserialize, Serialize};
 
+// Independent v2 structured daemon wire format. PTY v1 remains frozen and
+// continues serving existing sessions in its original socket namespace.
+pub mod structured_v2;
+
 /// 与 `src/render-protocol.ts` 的 `RENDER_PROTOCOL_VERSION` 必须一致。
 pub const RENDER_PROTOCOL_VERSION: u32 = 1;
 

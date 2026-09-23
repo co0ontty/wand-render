@@ -38,8 +38,9 @@ VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
 # 只认常量定义行：文件头注释里也出现了这个标识符，按标识符 grep 会先命中注释而拿到空值。
 # 必须锚到 `: u32 = `：宽松写法会先吃掉类型名 `u32` 里的 32，把协议版本解析成 32。
 PROTOCOL_VERSION="$(sed -n 's/^pub const RENDER_PROTOCOL_VERSION: *u32 *= *\([0-9][0-9]*\).*/\1/p' crates/wand-render-protocol/src/lib.rs | head -1)"
+STRUCTURED_PROTOCOL_VERSION="$(sed -n 's/^pub const STRUCTURED_PROTOCOL_VERSION: *u32 *= *\([0-9][0-9]*\).*/\1/p' crates/wand-render-protocol/src/structured_v2.rs | head -1)"
 MIN_SERVER_VERSION="$(sed -n 's/.*"minServerVersion": *"\([^"]*\)".*/\1/p' release.json)"
-if [ -z "$VERSION" ] || [ -z "$PROTOCOL_VERSION" ] || [ -z "$MIN_SERVER_VERSION" ]; then
+if [ -z "$VERSION" ] || [ -z "$PROTOCOL_VERSION" ] || [ -z "$STRUCTURED_PROTOCOL_VERSION" ] || [ -z "$MIN_SERVER_VERSION" ]; then
   echo "cannot resolve version (crate=$VERSION protocol=$PROTOCOL_VERSION minServer=$MIN_SERVER_VERSION)" >&2
   exit 1
 fi
@@ -60,21 +61,26 @@ if [ -n "${MUSL_CC:-}" ]; then
   echo "[package] linker: $LINKER_VAR=$MUSL_CC"
 fi
 
-cargo build --release --locked --target "$TARGET" -p wand-renderd
+cargo build --release --locked --target "$TARGET" -p wand-renderd -p wand-structured-renderd
 
 # 必须尊重 CARGO_TARGET_DIR：CI 常把 target 指到缓存目录，硬编码 target/ 会找不到产物。
 TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 SRC="$TARGET_DIR/$TARGET/release/wand-render"
+STRUCTURED_SRC="$TARGET_DIR/$TARGET/release/wand-structured-renderd"
 [ -x "$SRC" ] || { echo "build did not produce $SRC" >&2; exit 1; }
+[ -x "$STRUCTURED_SRC" ] || { echo "build did not produce $STRUCTURED_SRC" >&2; exit 1; }
 
 OUT_DIR="${OUT_DIR:-dist}/v$VERSION/$TRIPLE"
 mkdir -p "$OUT_DIR" "dist/native/$TRIPLE"
 cp "$SRC" "$OUT_DIR/wand-render"
+cp "$STRUCTURED_SRC" "$OUT_DIR/wand-structured-renderd"
 printf '%s\n' "$VERSION" > "$OUT_DIR/wand-render.version"
 printf '%s\n' "$PROTOCOL_VERSION" > "$OUT_DIR/wand-render.protocol"
+printf '%s\n' "$VERSION" > "$OUT_DIR/wand-structured-renderd.version"
+printf '%s\n' "$STRUCTURED_PROTOCOL_VERSION" > "$OUT_DIR/wand-structured-renderd.protocol"
 
 # 分发路径上必须可执行：npm/git 传输过程会丢可执行位（legacy 的 node-pty spawn-helper 就栽在这）。
-chmod 0755 "$OUT_DIR/wand-render"
+chmod 0755 "$OUT_DIR/wand-render" "$OUT_DIR/wand-structured-renderd"
 
 # 自检：产物必须能被执行并报出版本。stub 或损坏的二进制在这里被拦下，
 # 绝不进入分发目录（曾经有一个只打印 "(stub)" 的 302KB 假二进制进过 native/）。
@@ -99,15 +105,30 @@ case "$PROTOCOL_VERSION" in
   *) echo "implausible protocol version parsed from source: $PROTOCOL_VERSION" >&2; exit 1 ;;
 esac
 
+STRUCTURED_RUN_VERSION="$("$OUT_DIR/wand-structured-renderd" --version 2>&1 || true)"
+case "$STRUCTURED_RUN_VERSION" in
+  *"$VERSION"*"(protocol $STRUCTURED_PROTOCOL_VERSION)"*) ;;
+  *) echo "structured binary reported wrong version/protocol: $STRUCTURED_RUN_VERSION" >&2; exit 1 ;;
+esac
+case "$STRUCTURED_RUN_VERSION" in
+  *stub*|*TODO*) echo "structured binary looks like a stub" >&2; exit 1 ;;
+esac
+
 SHA="$(sha256_of "$OUT_DIR/wand-render")"
 SIZE="$(wc -c < "$OUT_DIR/wand-render" | tr -d ' ')"
+STRUCTURED_SHA="$(sha256_of "$OUT_DIR/wand-structured-renderd")"
+STRUCTURED_SIZE="$(wc -c < "$OUT_DIR/wand-structured-renderd" | tr -d ' ')"
 printf '%s  wand-render\n' "$SHA" > "$OUT_DIR/wand-render.sha256"
+printf '%s  wand-structured-renderd\n' "$STRUCTURED_SHA" > "$OUT_DIR/wand-structured-renderd.sha256"
 
 # main 仓库直接取用的布局，与 wand-render-bin 的布局保持同构。
 cp "$OUT_DIR/wand-render" "dist/native/$TRIPLE/wand-render"
 cp "$OUT_DIR/wand-render.version" "dist/native/$TRIPLE/wand-render.version"
 cp "$OUT_DIR/wand-render.sha256" "dist/native/$TRIPLE/wand-render.sha256"
-chmod 0755 "dist/native/$TRIPLE/wand-render"
+for name in wand-structured-renderd wand-structured-renderd.version wand-structured-renderd.sha256; do
+  cp "$OUT_DIR/$name" "dist/native/$TRIPLE/$name"
+done
+chmod 0755 "dist/native/$TRIPLE/wand-render" "dist/native/$TRIPLE/wand-structured-renderd"
 
 mkdir -p dist/fragments
 cat > "dist/fragments/$TRIPLE.json" <<JSON
@@ -118,8 +139,13 @@ cat > "dist/fragments/$TRIPLE.json" <<JSON
   "protocolVersion": $PROTOCOL_VERSION,
   "minServerVersion": "$MIN_SERVER_VERSION",
   "sha256": "$SHA",
-  "size": $SIZE
+  "size": $SIZE,
+  "structured": {
+    "protocolVersion": $STRUCTURED_PROTOCOL_VERSION,
+    "sha256": "$STRUCTURED_SHA",
+    "size": $STRUCTURED_SIZE
+  }
 }
 JSON
 
-echo "[package] wrote $OUT_DIR/wand-render ($SIZE bytes, sha256 $SHA)"
+echo "[package] wrote $OUT_DIR/wand-render ($SIZE bytes) + wand-structured-renderd ($STRUCTURED_SIZE bytes)"

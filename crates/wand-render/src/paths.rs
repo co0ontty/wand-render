@@ -61,6 +61,32 @@ pub fn render_paths(config_path: &Path) -> RenderPaths {
   }
 }
 
+/// v2 structured runs have a separate socket/token/pid namespace from both
+/// Render PTY v1 and legacy terminald. A v1 daemon cannot adopt these runs.
+pub fn structured_render_paths(config_path: &Path) -> RenderPaths {
+  let resolved = normalized_absolute(config_path);
+  let suffix = config_suffix(&resolved);
+  let dir = resolved.parent().unwrap_or(Path::new("/"));
+  RenderPaths {
+    socket_path: structured_socket_path(&suffix),
+    token_path: dir.join(format!(".structured-render-{suffix}.token")),
+    pid_path: dir.join(format!(".structured-render-{suffix}.pid")),
+    meta_path: dir.join(format!(".structured-render-{suffix}.json")),
+  }
+}
+
+pub fn structured_socket_path(suffix: &str) -> PathBuf {
+  #[cfg(unix)]
+  {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/tmp/wand-structured-render-{uid}-{suffix}.sock"))
+  }
+  #[cfg(not(unix))]
+  {
+    PathBuf::from(format!(r"\\.\pipe\wand-structured-render-{suffix}"))
+  }
+}
+
 /// 传输端点：Unix 用 domain socket，Windows 用命名管道（协议 §9.5.1）。
 ///
 /// Unix socket 放 `/tmp` 是为了短路径（macOS 的 sun_path 上限约 104 字节）；
@@ -150,6 +176,18 @@ mod tests {
     ));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
+  }
+
+  #[test]
+  fn structured_namespace_never_aliases_pty() {
+    let config = Path::new("/tmp/wand-dev/config.json");
+    let v1 = render_paths(config);
+    let v2 = structured_render_paths(config);
+    assert_ne!(v1.socket_path, v2.socket_path);
+    assert_ne!(v1.token_path, v2.token_path);
+    assert_ne!(v1.pid_path, v2.pid_path);
+    assert_ne!(v1.meta_path, v2.meta_path);
+    assert!(v2.socket_path.to_string_lossy().contains("wand-structured-render-"));
   }
 
   #[test]

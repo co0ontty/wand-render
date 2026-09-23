@@ -221,7 +221,12 @@ fn shutdown_loop(registry: &RenderRegistry, requests: &Receiver<ShutdownMode>) -
 fn prepare_socket_path(paths: &RenderPaths) -> Result<()> {
   let socket_path = paths.socket_path.as_path();
   match security::inspect_socket_path(socket_path) {
-    ExistingSocket::Absent => Ok(()),
+    ExistingSocket::Absent => {
+      if let Some(pid) = live_owner_pid(&paths.pid_path) {
+        return Err(anyhow!("Render owner is alive (pid {pid}); waiting for socket recovery"));
+      }
+      Ok(())
+    },
     ExistingSocket::Owned => {
       // pid 文件是 daemon 自己的权威存活记录：它先写 pid 再 bind，所以
       // 「pid 活着」比「connect 能不能连上」更可靠（后者会与 close 竞争）。

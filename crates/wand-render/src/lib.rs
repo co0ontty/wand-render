@@ -14,6 +14,8 @@ pub mod resources;
 /// 这些只在 Unix 上存在（协议 §9.5.2）。
 #[cfg(unix)]
 pub mod security;
+#[cfg(unix)]
+pub mod socket_keepalive;
 pub mod session;
 pub mod signal;
 pub mod sink;

@@ -33,12 +33,14 @@ type DispatchResult = Result<JsonValue, (ErrorCode, String)>;
 pub fn tokens_match(expected: &str, provided: &str) -> bool {
   let expected = expected.as_bytes();
   let provided = provided.as_bytes();
-  let mut diff = (expected.len() ^ provided.len()) as u8;
+  // A u8 truncates lengths modulo 256: appending 256 NUL bytes would otherwise
+  // pass constant-time comparison when the common prefix is identical.
+  let mut diff = expected.len() ^ provided.len();
   let length = expected.len().max(provided.len()).max(1);
   for index in 0..length {
     let left = expected.get(index).copied().unwrap_or(0);
     let right = provided.get(index).copied().unwrap_or(0);
-    diff |= left ^ right;
+    diff |= (left ^ right) as usize;
   }
   diff == 0
 }
@@ -224,11 +226,22 @@ impl RenderServer {
 
   /// 接受连接直到进程退出。单条连接的失败绝不影响别的连接与 PTY。
   pub fn serve(self: &Arc<Self>, listener: std::os::unix::net::UnixListener) {
-    for stream in listener.incoming() {
-      match stream {
-        Ok(stream) => self.accept_connection(stream),
-        // accept 失败（EMFILE / ECONNABORTED）不能让 daemon 退出。
-        Err(_) => continue,
+    let path = match listener.local_addr().ok().and_then(|addr| addr.as_pathname().map(|p| p.to_path_buf())) {
+      Some(path) => path,
+      None => { eprintln!("wand-render: listener has no socket path"); return; }
+    };
+    let mut listener = match wand_render::socket_keepalive::RecoveringListener::new(listener, path) {
+      Ok(listener) => listener,
+      Err(error) => { eprintln!("wand-render: cannot monitor socket: {error}"); return; }
+    };
+    loop {
+      match listener.accept() {
+        Ok((stream, _)) => self.accept_connection(stream),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+          std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Back off resource exhaustion instead of spinning at 100% CPU.
+        Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
       }
     }
   }
@@ -521,6 +534,7 @@ mod tests {
     assert!(!tokens_match("abc123", ""));
     assert!(!tokens_match("", "x"));
     assert!(tokens_match("", ""));
+    assert!(!tokens_match("abc123", &format!("abc123{}", "\0".repeat(256))));
   }
 
   #[test]

@@ -96,11 +96,15 @@ jobs:
           BIN="dist/v$VERSION/$TRIPLE/wand-render"
           test -x "$BIN" || { echo "packaged binary missing: $BIN" >&2; exit 1; }
           echo "smoke: $BIN"
+          STRUCTURED="dist/v$VERSION/$TRIPLE/wand-structured-renderd"
+          test -x "$STRUCTURED" || { echo "packaged structured binary missing: $STRUCTURED" >&2; exit 1; }
           if [ "$TRIPLE" = "darwin-x64" ]; then
-            # 交叉编译产物在 arm64 runner 上通过 Rosetta 执行，这是「交叉编译结果真能跑」的证据。
+            # 交叉编译产物在 arm64 runner 上通过 Rosetta 执行。
             arch -x86_64 "$BIN" --version
+            arch -x86_64 "$STRUCTURED" --version
           else
             "$BIN" --version
+            "$STRUCTURED" --version
           fi
 
       - uses: actions/upload-artifact@v4
@@ -155,7 +159,7 @@ jobs:
             triple="${triple#binary-}"
             mkdir -p "dist/v$VERSION/$triple"
             cp -R "$dir". "dist/v$VERSION/$triple/"
-            chmod 0755 "dist/v$VERSION/$triple/wand-render"
+            chmod 0755 "dist/v$VERSION/$triple/wand-render" "dist/v$VERSION/$triple/wand-structured-renderd"
             found="$found $triple"
           done
           if [ -z "$found" ]; then
@@ -174,7 +178,7 @@ jobs:
           set -euo pipefail
           MISSING=""
           for TRIPLE in $(bash -c '. scripts/triples.sh; supported_triples'); do
-            if [ ! -x "dist/v$VERSION/$TRIPLE/wand-render" ]; then
+            if [ ! -x "dist/v$VERSION/$TRIPLE/wand-render" ] || [ ! -x "dist/v$VERSION/$TRIPLE/wand-structured-renderd" ]; then
               MISSING="$MISSING $TRIPLE"
             fi
           done
@@ -192,7 +196,7 @@ jobs:
           node scripts/update-manifest.mjs --bin-dir dist/binstage --dist-dir dist
           cp dist/binstage/manifest.json "dist/manifest.json"
           # 同样不假设 shasum 存在：ubuntu runner 上有 sha256sum。
-          ( cd "dist/v$VERSION" && find . -name wand-render -type f | sort | while read -r file; do
+          ( cd "dist/v$VERSION" && find . -type f \( -name wand-render -o -name wand-structured-renderd \) | sort | while read -r file; do
               if command -v sha256sum >/dev/null 2>&1; then sha256sum "$file"; else shasum -a 256 "$file"; fi
             done ) > "dist/checksums.txt"
           cat dist/manifest.json
@@ -211,6 +215,7 @@ jobs:
           for TRIPLE in $(bash -c '. scripts/triples.sh; supported_triples'); do
             tar -czf "dist/assets/wand-render-$VERSION-$TRIPLE.tar.gz" -C "dist/v$VERSION" "$TRIPLE"
             cp "dist/v$VERSION/$TRIPLE/wand-render.sha256" "dist/assets/wand-render-$VERSION-$TRIPLE.sha256"
+            cp "dist/v$VERSION/$TRIPLE/wand-structured-renderd.sha256" "dist/assets/wand-structured-renderd-$VERSION-$TRIPLE.sha256"
           done
           cp dist/manifest.json dist/assets/manifest.json
           cp dist/checksums.txt dist/assets/checksums.txt

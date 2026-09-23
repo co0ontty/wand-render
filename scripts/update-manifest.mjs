@@ -57,21 +57,32 @@ function main() {
     throw new Error(`protocol mismatch for ${version}: manifest=${entry.protocolVersion} fragment=${fragments[0].protocolVersion}`);
   }
 
+  const hasStructured = Boolean(fragments[0].structured);
+  if (fragments.some((fragment) => Boolean(fragment.structured) !== hasStructured)) {
+    throw new Error("mixed structured binary support in one release");
+  }
   for (const fragment of fragments) {
     const sourceDir = path.join(distDir, `v${version}`, fragment.triple);
     const targetDir = path.join(options.binDir, `v${version}`, fragment.triple);
     if (!options.dryRun) {
       mkdirSync(targetDir, { recursive: true });
-      for (const name of ["wand-render", "wand-render.version", "wand-render.sha256"]) {
-        copyFileSync(path.join(sourceDir, name), path.join(targetDir, name));
-      }
+      const names = ["wand-render", "wand-render.version", "wand-render.sha256"];
+      if (hasStructured) names.push("wand-structured-renderd", "wand-structured-renderd.version", "wand-structured-renderd.sha256");
+      for (const name of names) copyFileSync(path.join(sourceDir, name), path.join(targetDir, name));
       chmodSync(path.join(targetDir, "wand-render"), 0o755);
+      if (hasStructured) chmodSync(path.join(targetDir, "wand-structured-renderd"), 0o755);
     }
     entry.triples[fragment.triple] = {
       path: `v${version}/${fragment.triple}/wand-render`,
       sha256: fragment.sha256,
       size: fragment.size,
       rustTarget: fragment.rustTarget,
+      ...(hasStructured ? { structured: {
+        path: `v${version}/${fragment.triple}/wand-structured-renderd`,
+        sha256: fragment.structured.sha256,
+        size: fragment.structured.size,
+        protocolVersion: fragment.structured.protocolVersion,
+      } } : {}),
     };
   }
   manifest.versions[version] = entry;
