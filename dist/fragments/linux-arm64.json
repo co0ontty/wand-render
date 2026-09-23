@@ -1,0 +1,9 @@
+{
+  "triple": "linux-arm64",
+  "rustTarget": "aarch64-unknown-linux-musl",
+  "version": "0.1.1",
+  "protocolVersion": 1,
+  "minServerVersion": "4.73.0",
+  "sha256": "30dfc2b7d210070a16a65385f052e4a82554fb6ab319641c063680569414ee5f",
+  "size": 987224
+}

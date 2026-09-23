@@ -8,6 +8,22 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+# sha256 的可移植实现：`shasum` 是 macOS/perl 专属，精简 Linux 镜像里没有；
+# 不能假设 runner 上一定有哪一个，所以按可用性退化。
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | awk '{print $NF}'
+  else
+    echo "找不到 sha256 工具（需要 sha256sum / shasum / openssl 之一）" >&2
+    return 1
+  fi
+}
+
 . scripts/triples.sh
 
 TRIPLE="${TRIPLE:-$(host_triple)}"
@@ -30,15 +46,25 @@ fi
 
 echo "[package] triple=$TRIPLE target=$TARGET version=$VERSION protocol=$PROTOCOL_VERSION"
 
-# 静态 musl 的 rustflags 在 .cargo/config.toml；这里只负责装 target。
+# 静态 musl 的 rustflags 在 .cargo/config.toml；这里只负责装 target 与指定链接器。
 if ! rustup target list --installed | grep -qx "$TARGET"; then
   echo "[package] installing rust target $TARGET"
   rustup target add "$TARGET"
 fi
 
+# musl 目标的默认链接器是 cc，会找不到 musl 的 libc；CI 通过 MUSL_CC 传 musl-gcc。
+# 变量名必须按 cargo 的规范：CARGO_TARGET_<TRIPLE 大写、分隔符换下划线>_LINKER。
+if [ -n "${MUSL_CC:-}" ]; then
+  LINKER_VAR="CARGO_TARGET_$(printf '%s' "$TARGET" | tr '[:lower:]-' '[:upper:]_')_LINKER"
+  export "$LINKER_VAR=$MUSL_CC"
+  echo "[package] linker: $LINKER_VAR=$MUSL_CC"
+fi
+
 cargo build --release --locked --target "$TARGET" -p wand-renderd
 
-SRC="target/$TARGET/release/wand-render"
+# 必须尊重 CARGO_TARGET_DIR：CI 常把 target 指到缓存目录，硬编码 target/ 会找不到产物。
+TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+SRC="$TARGET_DIR/$TARGET/release/wand-render"
 [ -x "$SRC" ] || { echo "build did not produce $SRC" >&2; exit 1; }
 
 OUT_DIR="${OUT_DIR:-dist}/v$VERSION/$TRIPLE"
@@ -73,7 +99,7 @@ case "$PROTOCOL_VERSION" in
   *) echo "implausible protocol version parsed from source: $PROTOCOL_VERSION" >&2; exit 1 ;;
 esac
 
-SHA="$(shasum -a 256 "$OUT_DIR/wand-render" | awk '{print $1}')"
+SHA="$(sha256_of "$OUT_DIR/wand-render")"
 SIZE="$(wc -c < "$OUT_DIR/wand-render" | tr -d ' ')"
 printf '%s  wand-render\n' "$SHA" > "$OUT_DIR/wand-render.sha256"
 

@@ -1,5 +1,8 @@
 name: CI
 
+# 四个平台都要跑测试：真 PTY 集成测试是「Render 能用」的核心证据，
+# 而 darwin/linux 的 PTY 语义（信号、resize、进程组）由不同内核代码路径实现，
+# 只在一个平台上绿过不算数。
 on:
   push:
     branches: [main, master]
@@ -14,14 +17,37 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { triple: darwin-arm64, runner: macos-14 }
-          - { triple: darwin-x64, runner: macos-13 }
-          - { triple: linux-x64, runner: ubuntu-24.04 }
-          - { triple: linux-arm64, runner: ubuntu-24.04-arm }
+          - triple: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - triple: darwin-x64
+            runner: macos-14
+            target: x86_64-apple-darwin
+          - triple: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - triple: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+
       - name: Toolchain
         run: rustup show active-toolchain && rustc --version
-      - name: Test
-        # 真 PTY 集成测试必须跑：协议里 seq/快照/UTF-8 切分这些保证只在真 PTY 下才成立。
-        run: cargo test --locked --all-targets
+
+      # musl 目标需要 musl 链接器（Ubuntu 的 musl-tools 匹配 runner 自身架构）。
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'linux-musl')
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          echo "MUSL_CC=musl-gcc" >> "$GITHUB_ENV"
+
+      # 按目标平台编译并测试：Linux 上跑的是静态 musl 产物，
+      # 与真正发给用户的二进制是同一条构建路径。
+      - name: Test (${{ matrix.target }})
+        run: cargo test --locked --all-targets --target "${{ matrix.target }}"

@@ -1,5 +1,19 @@
 name: Release
 
+# 四平台产物在这里构建并挂到 GitHub Release；再由 co0ontty/wand-render-bin 的
+# sync workflow 拉取并提交（那边用自己仓库的 GITHUB_TOKEN，所以不需要跨仓库 PAT）。
+#
+# 为什么 Linux 用 musl：Server 可能跑在任意发行版上，动态链接 glibc 会在旧发行版上
+# 直接起不来（GLIBC_x.y not found）。所以 .cargo/config.toml 里开 crt-static。
+#
+# 为什么两个 darwin 目标都在 arm64 runner 上编：x86_64-apple-darwin 可以交叉编译，
+# 不依赖 Intel runner 的可用性（macos-13 正在退役）。
+#
+# Windows 不在这里出包：协议要求 Render 独立寻址与独立升级，Windows 需要命名管道
+# 而不是 Unix socket，PTY 要换 ConPTY，SIGHUP/SIGWINCH 语义也不存在 ——
+# 那是实现工作，不是加一个 matrix 条目。当前 Windows 上启动会给出明确错误并回落到
+# legacy terminald（见 docs/render-protocol.md §9.5.1、README 的支持矩阵）。
+
 on:
   push:
     tags: ["v[0-9]*"]
@@ -20,25 +34,73 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { triple: darwin-arm64, runner: macos-14 }
-          - { triple: darwin-x64, runner: macos-13 }
-          - { triple: linux-x64, runner: ubuntu-24.04 }
-          - { triple: linux-arm64, runner: ubuntu-24.04-arm }
+          - triple: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            cross: false
+          - triple: darwin-x64
+            runner: macos-14
+            target: x86_64-apple-darwin
+            cross: true
+          - triple: linux-x64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            cross: false
+          - triple: linux-arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            cross: false
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+
       - name: Toolchain
         run: rustup show active-toolchain && rustc --version
-      - name: Test before packaging
+
+      # musl 目标需要一个 musl 链接器；不装的话 cargo 会因为找不到 cc 而失败。
+      - name: Install musl toolchain
+        if: startsWith(matrix.target, 'x86_64-unknown-linux') || startsWith(matrix.target, 'aarch64-unknown-linux')
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+          # Ubuntu 的 musl-tools 提供的 musl-gcc 是针对 runner 自身架构的，
+          # 所以 arm64 目标要放在 arm64 runner 上（矩阵里已经这么配），链接器名都是 musl-gcc。
+          echo "MUSL_CC=musl-gcc" >> "$GITHUB_ENV"
+
+      # 测试在宿主平台上跑（真 PTY 集成测试必须在能 fork PTY 的平台上执行）。
+      # darwin-x64 的交叉编译产物另有一步 Rosetta 冒烟。
+      - name: Test
         run: cargo test --locked --all-targets
+
       - name: Package
         env:
           TRIPLE: ${{ matrix.triple }}
         run: scripts/package-release.sh
+
+      - name: Smoke test the packaged binary
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          BIN="dist/v${VERSION:-$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')}/$TRIPLE/wand-render"
+          BIN="$(ls dist/v*/$TRIPLE/wand-render)"
+          echo "smoke: $BIN"
+          if [ "$TRIPLE" = "darwin-x64" ]; then
+            # 交叉编译产物在 arm64 runner 上通过 Rosetta 执行，确认真能跑。
+            arch -x86_64 "$BIN" --version
+          else
+            "$BIN" --version
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: fragment-${{ matrix.triple }}
           path: dist/fragments/${{ matrix.triple }}.json
           if-no-files-found: error
+
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.triple }}
@@ -46,56 +108,65 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: publish artifacts
+    name: publish release
     needs: [build]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Toolchain
-        run: rustup show active-toolchain
+
       - uses: actions/download-artifact@v4
         with:
           pattern: fragment-*
           path: dist/fragments
           merge-multiple: true
+
       - uses: actions/download-artifact@v4
         with:
           pattern: binary-*
           path: dist/binaries
           merge-multiple: true
+
       - name: Restore dist/v<version>/<triple> layout
-        # download-artifact 会抹平 v*/ 那一层，这里按目录名重建，保持与本地一致。
+        # download-artifact 会抹平 v*/ 那一层，这里按目录名重建，保持与本地布局一致。
         run: |
           set -euo pipefail
           VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           mkdir -p "dist/v$VERSION"
           for dir in dist/binaries/*/; do
-            triple="$(basename "$dir")"
-            cp -R "$dir" "dist/v$VERSION/$triple"
+            cp -R "$dir" "dist/v$VERSION/$(basename "$dir")"
           done
           ls -R "dist/v$VERSION"
-      - name: Checkout artifacts repository
-        uses: actions/checkout@v4
-        with:
-          repository: co0ontty/wand-render-bin
-          # 用 PAT 而不是 GITHUB_TOKEN：默认 token 只能写当前仓库，跨仓库推送必须用 PAT。
-          token: ${{ secrets.RENDER_BIN_TOKEN }}
-          path: render-bin
-      - name: Update manifest and stage binaries
-        run: node scripts/update-manifest.mjs --bin-dir render-bin
-      - name: Push artifacts
-        working-directory: render-bin
+
+      - name: Assert all supported triples are present
+        # 少一个平台就发版 = 那个平台的用户静默回落到 legacy，这条必须在发布之前断掉。
         run: |
           set -euo pipefail
-          git config user.name "wand-render ci"
-          git config user.email "ci@users.noreply.github.com"
-          git add -A
-          if git diff --cached --quiet; then
-            echo "no artifact changes"
-          else
-            git commit -m "Publish wand-render ${GITHUB_REF_NAME:-manual}"
-            git push
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          MISSING=""
+          for TRIPLE in $(bash -c '. scripts/triples.sh; supported_triples'); do
+            if [ ! -x "dist/v$VERSION/$TRIPLE/wand-render" ]; then
+              MISSING="$MISSING $TRIPLE"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "missing artifacts for:$MISSING" >&2
+            exit 1
           fi
+          echo "all supported triples present"
+
+      - name: Build release manifest and checksums
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          node scripts/update-manifest.mjs --bin-dir dist/binstage --dist-dir dist
+          cp dist/binstage/manifest.json "dist/manifest.json"
+          # 同样不假设 shasum 存在：ubuntu runner 上有 sha256sum。
+          ( cd "dist/v$VERSION" && find . -name wand-render -type f | sort | while read -r file; do
+              if command -v sha256sum >/dev/null 2>&1; then sha256sum "$file"; else shasum -a 256 "$file"; fi
+            done ) > "dist/checksums.txt"
+          cat dist/manifest.json
+          cat dist/checksums.txt
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -103,8 +174,18 @@ jobs:
           set -euo pipefail
           VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
           TAG="v$VERSION"
+          # 每个平台一个 tar.gz + 顶层 manifest/checksums：
+          # wand-render-bin 的 sync workflow 就按这个结构下载与校验。
+          mkdir -p dist/assets
+          for TRIPLE in $(bash -c '. scripts/triples.sh; supported_triples'); do
+            tar -czf "dist/assets/wand-render-$VERSION-$TRIPLE.tar.gz" -C "dist/v$VERSION" "$TRIPLE"
+            cp "dist/v$VERSION/$TRIPLE/wand-render.sha256" "dist/assets/wand-render-$VERSION-$TRIPLE.sha256"
+          done
+          cp dist/manifest.json dist/assets/manifest.json
+          cp dist/checksums.txt dist/assets/checksums.txt
+          ls -l dist/assets
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "release $TAG already exists"
+            gh release upload "$TAG" dist/assets/* --clobber
           else
-            gh release create "$TAG" --title "wand-render $VERSION" --generate-notes "dist/v$VERSION"/*/*/wand-render
+            gh release create "$TAG" --title "wand-render $VERSION" --generate-notes dist/assets/*
           fi
