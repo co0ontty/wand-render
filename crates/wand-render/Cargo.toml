@@ -1,0 +1,24 @@
+[package]
+name = "wand-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+wand-render-protocol = { path = "../wand-render-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+portable-pty.workspace = true
+vt100.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+# 路径派生必须与 src/render-protocol.ts 的 sha256 前缀算法逐字节一致。
+sha2 = "0.10"
+
+[dev-dependencies]
+# 集成测试要用同一份协议类型、同一个 VT 解析器做「屏幕等价」自检。
+wand-render-protocol = { path = "../wand-render-protocol" }
+vt100.workspace = true
+libc.workspace = true

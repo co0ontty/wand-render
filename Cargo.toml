@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/wand-render-protocol",
+  "crates/wand-render",
+  "crates/wand-renderd",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+portable-pty = "0.9"
+vt100 = "0.16"
+anyhow = "1"
+thiserror = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true

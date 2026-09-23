@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的版本（必须等于 Cargo.toml 的 workspace version）"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.triple }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { triple: darwin-arm64, runner: macos-14 }
+          - { triple: darwin-x64, runner: macos-13 }
+          - { triple: linux-x64, runner: ubuntu-24.04 }
+          - { triple: linux-arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show active-toolchain && rustc --version
+      - name: Test before packaging
+        run: cargo test --locked --all-targets
+      - name: Package
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: scripts/package-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fragment-${{ matrix.triple }}
+          path: dist/fragments/${{ matrix.triple }}.json
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.triple }}
+          path: dist/v*/${{ matrix.triple }}/
+          if-no-files-found: error
+
+  publish:
+    name: publish artifacts
+    needs: [build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show active-toolchain
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fragment-*
+          path: dist/fragments
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          path: dist/binaries
+          merge-multiple: true
+      - name: Restore dist/v<version>/<triple> layout
+        # download-artifact 会抹平 v*/ 那一层，这里按目录名重建，保持与本地一致。
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          mkdir -p "dist/v$VERSION"
+          for dir in dist/binaries/*/; do
+            triple="$(basename "$dir")"
+            cp -R "$dir" "dist/v$VERSION/$triple"
+          done
+          ls -R "dist/v$VERSION"
+      - name: Checkout artifacts repository
+        uses: actions/checkout@v4
+        with:
+          repository: co0ontty/wand-render-bin
+          # 用 PAT 而不是 GITHUB_TOKEN：默认 token 只能写当前仓库，跨仓库推送必须用 PAT。
+          token: ${{ secrets.RENDER_BIN_TOKEN }}
+          path: render-bin
+      - name: Update manifest and stage binaries
+        run: node scripts/update-manifest.js --bin-dir render-bin
+      - name: Push artifacts
+        working-directory: render-bin
+        run: |
+          set -euo pipefail
+          git config user.name "wand-render ci"
+          git config user.email "ci@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no artifact changes"
+          else
+            git commit -m "Publish wand-render ${GITHUB_REF_NAME:-manual}"
+            git push
+          fi
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists"
+          else
+            gh release create "$TAG" --title "wand-render $VERSION" --generate-notes "dist/v$VERSION"/*/*/wand-render
+          fi

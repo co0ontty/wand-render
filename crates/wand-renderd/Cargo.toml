@@ -1,0 +1,18 @@
+[package]
+name = "wand-renderd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "wand-render"
+path = "src/main.rs"
+
+[dependencies]
+wand-render = { path = "../wand-render" }
+wand-render-protocol = { path = "../wand-render-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+anyhow.workspace = true

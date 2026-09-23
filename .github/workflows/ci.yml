@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.triple }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { triple: darwin-arm64, runner: macos-14 }
+          - { triple: darwin-x64, runner: macos-13 }
+          - { triple: linux-x64, runner: ubuntu-24.04 }
+          - { triple: linux-arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup show active-toolchain && rustc --version
+      - name: Test
+        # 真 PTY 集成测试必须跑：协议里 seq/快照/UTF-8 切分这些保证只在真 PTY 下才成立。
+        run: cargo test --locked --all-targets

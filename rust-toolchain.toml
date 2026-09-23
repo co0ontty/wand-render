@@ -1,0 +1,6 @@
+# 固定工具链：本地与 CI（含 wand-render-bin 产物）必须能复现同一二进制行为。
+# 升级时同步改 .github/workflows/*.yml 的 toolchain 与 README 的支持矩阵。
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
