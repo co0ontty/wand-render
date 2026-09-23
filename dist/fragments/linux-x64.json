@@ -1,9 +1,0 @@
-{
-  "triple": "linux-x64",
-  "rustTarget": "x86_64-unknown-linux-musl",
-  "version": "0.1.1",
-  "protocolVersion": 1,
-  "minServerVersion": "4.73.0",
-  "sha256": "6e047aeaa01852907df84c37db8d49688abdadd58d2697ed4505fe3196435b46",
-  "size": 1094256
-}

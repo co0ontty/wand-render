@@ -1,1 +1,4 @@
 /target
+# 构建产物（scripts/package-release.sh 写出）：源码仓库只放源码，
+# 二进制统一由 CI 挂到 Release、再由 wand-render-bin 收录。
+/dist/

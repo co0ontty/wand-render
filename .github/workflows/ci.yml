@@ -9,6 +9,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# 四平台矩阵成本不低，同一分支的旧运行被新推送取代后没有意义。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: test (${{ matrix.triple }})
