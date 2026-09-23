@@ -52,6 +52,138 @@ pub fn build(screen: &Screen, pending: Vec<PendingOp>, autowrap: bool) -> Termin
   }
 }
 
+/// `list` 返回的单个快照上限（协议 §9.1.1）：序列化后必须 ≤ 64KiB。
+///
+/// 这里没有放进 `wand-render-protocol`（协议单一真源）是因为本轮改动范围只覆盖
+/// Rust 侧实现；两侧一旦需要共享这个常量，应当提升到协议 crate 并同步 TS 镜像。
+pub const LIST_SNAPSHOT_MAX_BYTES: usize = 64 * 1024;
+
+/// `list` 用的有界快照（协议 §9.1.1）。
+///
+/// `list` 把一个响应里内联所有会话的输出、chunk 窗口与 5000 行回滚快照：单个
+/// 1000 列满回滚会话就能到 5MB，十几个会话会撞上单帧 `MAX_FRAME_BYTES`，而超限的
+/// 响应以前被静默丢弃 → 客户端只看到 10s 超时。裁剪顺序是「先丢最少信息，再保证
+/// 写进终端不会把终端卡住」：
+///
+/// 1. 完整快照已经够小 → 原样返回；
+/// 2. 丢掉 `pending`（它是基线之后的增量，丢了只是预览略旧）；
+/// 3. 截断 `data` 到前缀，并去掉末尾未收尾的转义序列；
+/// 4. 连元信息都放不下（`max_bytes` 极小）→ `None`（置空，客户端退回用 `output` 重放）。
+///
+/// 裁剪后的快照**刻意不是屏幕等价的**：它只服务「列表展示 + 有/无屏幕判断」，
+/// 需要精确重建屏幕的调用方必须走 `attach`（协议 §9.1.2）。
+pub fn bound_for_list(snapshot: TerminalSnapshot, max_bytes: usize) -> Option<TerminalSnapshot> {
+  if serialized_len(&snapshot).is_some_and(|length| length <= max_bytes) {
+    return Some(snapshot);
+  }
+  let mut candidate = snapshot;
+  candidate.pending.clear();
+  if serialized_len(&candidate).is_some_and(|length| length <= max_bytes) {
+    return Some(candidate);
+  }
+
+  // JSON 转义（`\r`、引号、控制字符）让「字符数」无法直接换算成字节数，
+  // 所以直接用真实序列化结果对字符数二分。已知完整 data 放不下，
+  // 所以在 [0, total) 里找最大的可放下前缀；候选里已经包含截断尾部的属性重置，
+  // 保证补完重置之后仍然不超预算。
+  let total = candidate.data.chars().count();
+  let mut low = 0usize;
+  let mut high = total;
+  while high - low > 1 {
+    let mid = low + (high - low) / 2;
+    if prefix_with_reset_fits(&candidate, mid, max_bytes) {
+      low = mid;
+    } else {
+      high = mid;
+    }
+  }
+  candidate.data = candidate.data.chars().take(low).collect();
+  let trimmed = trim_incomplete_escape(&candidate.data);
+  if trimmed.len() != candidate.data.len() {
+    candidate.data = trimmed.to_string();
+  }
+  candidate.data.push_str(SNAPSHOT_TRUNCATION_RESET);
+  serialized_len(&candidate)
+    .is_some_and(|length| length <= max_bytes)
+    .then_some(candidate)
+}
+
+/// 截断点可能停在任意 SGR 状态下：补一个重置，避免预览把后续输出染色。
+const SNAPSHOT_TRUNCATION_RESET: &str = "\u{1b}[0m";
+
+fn serialized_len(snapshot: &TerminalSnapshot) -> Option<usize> {
+  serde_json::to_vec(snapshot).ok().map(|body| body.len())
+}
+
+fn prefix_with_reset_fits(snapshot: &TerminalSnapshot, chars: usize, max_bytes: usize) -> bool {
+  let mut data: String = snapshot.data.chars().take(chars).collect();
+  data.push_str(SNAPSHOT_TRUNCATION_RESET);
+  let candidate = TerminalSnapshot {
+    data,
+    ..snapshot.clone()
+  };
+  serialized_len(&candidate).is_some_and(|length| length <= max_bytes)
+}
+
+/// 截断必须保证不留下**未收尾**的转义序列。
+///
+/// 例子：`data` 被截到 `...\x1b[3` 时，客户端把这段写进终端后，终端解析器会一直
+/// 等这条 CSI 的收尾字节，随后真正的输出会被吞进这条残缺序列里 —— 比「屏幕不完整」
+/// 严重得多。所以截断后要从末尾往前找，把最后一个未完成的 ESC 序列整段砍掉。
+fn trim_incomplete_escape(data: &str) -> &str {
+  let bytes = data.as_bytes();
+  let mut cut = data.len();
+  let mut search_end = data.len();
+  loop {
+    let index = match bytes[..search_end].iter().rposition(|byte| *byte == 0x1b) {
+      Some(index) => index,
+      None => return &data[..cut],
+    };
+    if escape_end(&bytes[index..]).is_some() {
+      return &data[..cut];
+    }
+    cut = index;
+    search_end = index;
+  }
+}
+
+/// 从 `bytes[0] == ESC` 开始，返回这条转义序列的收尾位置（不含收尾字符之后）。
+/// `None` 表示字符串在序列收尾前就结束了。
+fn escape_end(bytes: &[u8]) -> Option<usize> {
+  // 裸 ESC 结尾（没有第二个字节）本身就不完整。
+  let second = *bytes.get(1)?;
+  match second {
+    // CSI：参数字节 0x30..=0x3f 与中间字节 0x20..=0x2f，收尾字节 0x40..=0x7e。
+    b'[' => {
+      let mut index = 2;
+      while let Some(byte) = bytes.get(index).copied() {
+        match byte {
+          0x20..=0x3f => index += 1,
+          0x40..=0x7e => return Some(index + 1),
+          _ => return None,
+        }
+      }
+      None
+    }
+    // OSC(`]`) / DCS(`P`) / SOS(`X`) / PM(`^`) / APC(`_`)：以 BEL 或 ST(`ESC \`) 收尾。
+    b']' | b'P' | b'X' | b'^' | b'_' => {
+      let mut index = 2;
+      while let Some(byte) = bytes.get(index).copied() {
+        if byte == 0x07 {
+          return Some(index + 1);
+        }
+        if byte == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+          return Some(index + 2);
+        }
+        index += 1;
+      }
+      None
+    }
+    // 两字节序列（`ESC M`、`ESC 7` 等）本身就是完整的。
+    _ => Some(2),
+  }
+}
+
 /// 写出可见屏之上最多 `SCROLLBACK_LINES` 行历史。
 ///
 /// 在 `Screen` 的克隆上挪动 scrollback 偏移，避免动到正在被写入的屏幕；
@@ -344,6 +476,105 @@ mod tests {
     let mut replay = Parser::new(4, 20, 0);
     feed(&mut replay, snapshot.data.as_bytes());
     assert_eq!(replay.screen().contents(), parser.screen().contents());
+  }
+
+  // ── §9.1.1 list 快照裁剪 ──
+
+  fn manual_snapshot(data: &str, pending: &str) -> TerminalSnapshot {
+    TerminalSnapshot {
+      version: VERSION,
+      data: data.to_string(),
+      cols: 80,
+      rows: 24,
+      pending: if pending.is_empty() {
+        Vec::new()
+      } else {
+        vec![PendingOp::Data {
+          data: pending.to_string(),
+        }]
+      },
+    }
+  }
+
+  fn assert_no_dangling_escape(data: &str) {
+    let bytes = data.as_bytes();
+    if let Some(index) = bytes.iter().rposition(|byte| *byte == 0x1b) {
+      assert!(
+        escape_end(&bytes[index..]).is_some(),
+        "snapshot data ends inside an escape sequence: {:?}",
+        &data[index..]
+      );
+    }
+  }
+
+  #[test]
+  fn list_budget_keeps_small_snapshots_intact() {
+    let snapshot = manual_snapshot("\x1b[31mred\x1b[0m", "tail");
+    let bounded = bound_for_list(snapshot.clone(), LIST_SNAPSHOT_MAX_BYTES).expect("fits");
+    assert_eq!(bounded, snapshot);
+  }
+
+  /// pending 是基线之后的增量，超出预算时先丢它（attach 会给全量）。
+  #[test]
+  fn list_budget_drops_pending_before_truncating_data() {
+    let snapshot = manual_snapshot("visible", &"p".repeat(300_000));
+    assert!(serialized_len(&snapshot).expect("json") > LIST_SNAPSHOT_MAX_BYTES);
+    let bounded = bound_for_list(snapshot, LIST_SNAPSHOT_MAX_BYTES).expect("bounded");
+    assert!(bounded.pending.is_empty(), "pending must be dropped first");
+    assert_eq!(bounded.data, "visible", "data must survive dropping pending");
+    assert!(serialized_len(&bounded).expect("json") <= LIST_SNAPSHOT_MAX_BYTES);
+  }
+
+  /// data 自己超预算时截断成前缀，且绝不留未收尾的转义序列。
+  #[test]
+  fn list_budget_truncates_data_without_breaking_the_terminal() {
+    // 前缀全是转义序列，于是截断点大概率落在某条序列中间（正是 trim 要处理的形态）。
+    let snapshot = manual_snapshot(
+      &format!("{}{}", "\x1b[31m".repeat(200), "x".repeat(20_000)),
+      "",
+    );
+    let bounded = bound_for_list(snapshot.clone(), 1024).expect("bounded");
+    assert!(bounded.data.len() < snapshot.data.len(), "data must be truncated");
+    assert!(serialized_len(&bounded).expect("json") <= 1024);
+    assert_no_dangling_escape(&bounded.data);
+    // 截断后补一个属性重置，避免预览把后续输出染色。
+    assert!(bounded.data.ends_with("\x1b[0m"));
+
+    // 语义证据：把截断后的前缀写进终端再写 TAIL，TAIL 必须真的被打印出来
+    // （若前缀停在 `\x1b[3` 中间，TAIL 会被吞进那条残缺序列而消失）。
+    let mut replay = Parser::new(24, 80, 0);
+    replay.process(bounded.data.as_bytes());
+    replay.process(b"TAIL");
+    assert!(
+      replay.screen().contents().contains("TAIL"),
+      "truncated snapshot swallowed subsequent output"
+    );
+  }
+
+  /// 连元信息都放不下时置空（而不是回一个会撑爆帧的快照）。
+  #[test]
+  fn list_budget_nulls_out_when_even_metadata_does_not_fit() {
+    let snapshot = manual_snapshot("data", "pending");
+    assert!(bound_for_list(snapshot, 8).is_none());
+  }
+
+  #[test]
+  fn incomplete_escapes_are_trimmed() {
+    assert_eq!(trim_incomplete_escape("abc"), "abc");
+    assert_eq!(trim_incomplete_escape("abc\x1b"), "abc");
+    assert_eq!(trim_incomplete_escape("abc\x1b["), "abc");
+    assert_eq!(trim_incomplete_escape("abc\x1b[3"), "abc");
+    assert_eq!(trim_incomplete_escape("abc\x1b[31m"), "abc\x1b[31m");
+    // 前一条完整、后一条残缺：只砍残缺的那条。
+    assert_eq!(trim_incomplete_escape("abc\x1b[31m\x1b[3"), "abc\x1b[31m");
+    // OSC / DCS 必须有 BEL 或 ST 收尾。
+    assert_eq!(trim_incomplete_escape("abc\x1b]0;title"), "abc");
+    assert_eq!(trim_incomplete_escape("abc\x1b]0;title\x07"), "abc\x1b]0;title\x07");
+    assert_eq!(trim_incomplete_escape("abc\x1bP1;2"), "abc");
+    assert_eq!(trim_incomplete_escape("abc\x1bP1;2\x1b\\"), "abc\x1bP1;2\x1b\\");
+    // 两字节序列（ESC M / ESC 7）是完整的。
+    assert_eq!(trim_incomplete_escape("abc\x1bM"), "abc\x1bM");
+    assert_eq!(trim_incomplete_escape("\x1b"), "");
   }
 
   #[test]

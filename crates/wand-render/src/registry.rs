@@ -18,6 +18,7 @@ use crate::error::RenderError;
 use crate::resources::rss_bytes;
 use crate::session::Session;
 use crate::sink::EventSink;
+use crate::snapshot;
 use crate::time::iso8601_now;
 
 /// 快照维护线程的轮询间隔（远小于 100ms 静默窗口，保证及时固化基线）。
@@ -128,16 +129,37 @@ impl RenderRegistry {
     session.map(|session| session.state(after_seq))
   }
 
-  /// 批量读取会话状态。
+  /// 批量读取会话状态（`list` 专用）。
   ///
-  /// `list` 会把每个会话的 `output`/`chunks`/快照都内联进同一个响应，十几个大回滚
-  /// 会话就可能撞上单帧 `MAX_FRAME_BYTES`（调用方据此逐级降级，见 `wand-renderd` 的
-  /// `list_with_budget`）。**完整状态走 `attach`**。
-  pub fn list_with_options(&self, include_snapshot: bool, include_journal: bool) -> Vec<SessionState> {
+  /// 每个会话的 `terminalSnapshot` 按协议 §9.1.1 裁剪到 64KiB：`list` 把一个响应里
+  /// 内联所有会话，完整回滚快照（5000 行 × 1000 列可达 5MB）会让响应撞上单帧上限。
+  /// `output`/`chunks` 仍按 §4 的上限，需要精确重建屏幕的调用方走
+  /// `attach`/`create_or_attach`，它们返回完整状态。
+  pub fn list_sessions(&self) -> Vec<SessionState> {
     lock(&self.sessions)
       .values()
-      .map(|session| session.state_with_options(0, include_snapshot, include_journal))
+      .map(|session| {
+        let mut state = session.state(0);
+        state.terminal_snapshot = state.terminal_snapshot.and_then(|snapshot| {
+          snapshot::bound_for_list(snapshot, snapshot::LIST_SNAPSHOT_MAX_BYTES)
+        });
+        state
+      })
       .collect()
+  }
+
+  /// 仍在运行的会话数。
+  ///
+  /// `drain` 的退出条件（协议 §9.3）是「最后一个会话退出」，守护进程的关闭循环
+  /// 用它做判定，所以这里不能受已退出但尚未 forget 的会话影响。
+  pub fn running_session_count(&self) -> usize {
+    // 先克隆句柄再放开注册表锁：会话锁只在注册表锁之外拿（锁嵌套方向保持
+    // 「注册表 → 会话」，见 session.rs 的锁约定）。
+    let sessions: Vec<Arc<Session>> = lock(&self.sessions).values().cloned().collect();
+    sessions
+      .iter()
+      .filter(|session| session.is_running())
+      .count()
   }
 
   pub fn write(&self, session_id: &str, data: &str) -> Result<(), RenderError> {
@@ -204,15 +226,16 @@ impl RenderRegistry {
     self.shutting_down.store(true, Ordering::SeqCst);
     match mode {
       ShutdownMode::Drain => {
-        // 先收集再删，避免在持有注册表锁时去取会话锁。
-        let stale: Vec<String> = {
-          let sessions = lock(&self.sessions);
-          sessions
-            .iter()
-            .filter(|(_, session)| !session.is_running())
-            .map(|(session_id, _)| session_id.clone())
-            .collect()
-        };
+        // 先克隆句柄再放开注册表锁：`is_running()` 要拿会话锁，不能在持有注册表锁时嵌套。
+        let all: Vec<(String, Arc<Session>)> = lock(&self.sessions)
+          .iter()
+          .map(|(session_id, session)| (session_id.clone(), Arc::clone(session)))
+          .collect();
+        let stale: Vec<String> = all
+          .into_iter()
+          .filter(|(_, session)| !session.is_running())
+          .map(|(session_id, _)| session_id)
+          .collect();
         if !stale.is_empty() {
           let mut sessions = lock(&self.sessions);
           for session_id in stale {
@@ -277,5 +300,45 @@ mod tests {
     assert!(!registry.forget("nope"));
     assert_eq!(registry.stats().sessions, 0);
     registry.stop_maintenance();
+  }
+
+  #[test]
+  fn empty_registry_lists_nothing_and_reports_no_running_sessions() {
+    let registry = RenderRegistry::new("test", Arc::new(NullSink));
+    assert!(registry.list_sessions().is_empty());
+    assert_eq!(registry.running_session_count(), 0);
+    assert!(!registry.is_shutting_down());
+    registry.begin_shutdown(ShutdownMode::Drain);
+    assert!(registry.is_shutting_down());
+    assert_eq!(registry.running_session_count(), 0);
+    registry.stop_maintenance();
+  }
+
+  /// drain 只置位「不再接受新会话」，把退出决策留给守护进程的关闭循环。
+  #[test]
+  fn drain_flags_shutdown_without_touching_anything_else() {
+    let registry = RenderRegistry::new("test", Arc::new(NullSink));
+    registry.begin_shutdown(ShutdownMode::Drain);
+    assert!(registry.is_shutting_down());
+    assert!(matches!(
+      registry.create_or_attach(&params("late")),
+      Err(RenderError::Conflict(_))
+    ));
+    registry.stop_maintenance();
+  }
+
+  fn params(session_id: &str) -> wand_render_protocol::CreateOrAttachParams {
+    wand_render_protocol::CreateOrAttachParams {
+      session_id: session_id.to_string(),
+      file: "/bin/sh".to_string(),
+      args: Vec::new(),
+      cwd: std::env::temp_dir().to_string_lossy().to_string(),
+      env: std::collections::BTreeMap::new(),
+      name: "xterm-256color".to_string(),
+      cols: 80,
+      rows: 24,
+      launch_marker_token: None,
+      after_seq: 0,
+    }
   }
 }

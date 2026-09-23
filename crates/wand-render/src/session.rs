@@ -28,6 +28,7 @@ use wand_render_protocol::{
 use crate::bounds::{ChunkWindow, TextWindow};
 use crate::error::RenderError;
 use crate::marker::MarkerStripper;
+#[cfg(unix)]
 use crate::signal;
 use crate::sink::EventSink;
 use crate::snapshot::{self, DecModeTracker};
@@ -190,14 +191,14 @@ impl Session {
     let reader = match pair.master.try_clone_reader() {
       Ok(reader) => reader,
       Err(error) => {
-        kill_pid(child.process_id().unwrap_or(0), libc::SIGKILL);
+        force_kill(child.process_id().unwrap_or(0));
         return Err(RenderError::Spawn(format!("pty reader failed: {error}")));
       }
     };
     let writer = match pair.master.take_writer() {
       Ok(writer) => writer,
       Err(error) => {
-        kill_pid(child.process_id().unwrap_or(0), libc::SIGKILL);
+        force_kill(child.process_id().unwrap_or(0));
         return Err(RenderError::Spawn(format!("pty writer failed: {error}")));
       }
     };
@@ -252,7 +253,7 @@ impl Session {
       .name(format!("wand-render-read-{}", session.session_id))
       .spawn(move || reader_session.read_loop(reader));
     if let Err(error) = read_thread {
-      kill_pid(pid, libc::SIGKILL);
+      force_kill(pid);
       return Err(RenderError::Spawn(format!("reader thread failed: {error}")));
     }
 
@@ -261,7 +262,7 @@ impl Session {
       .name(format!("wand-render-exit-{}", session.session_id))
       .spawn(move || exit_session.exit_loop(child));
     if let Err(error) = exit_thread {
-      kill_pid(pid, libc::SIGKILL);
+      force_kill(pid);
       return Err(RenderError::Spawn(format!("exit thread failed: {error}")));
     }
 
@@ -273,20 +274,10 @@ impl Session {
   }
 
   /// 快照 `SessionState`；`chunks` 只包含 `seq > after_seq` 的部分（补洞数据）。
+  ///
+  /// 这里返回的是**完整**状态（协议 §9.1.4）：`list` 的快照裁剪只发生在
+  /// `RenderRegistry::list_sessions`，`attach` / `createOrAttach` 都必须走这里。
   pub fn state(&self, after_seq: u64) -> SessionState {
-    self.state_with_options(after_seq, true, true)
-  }
-
-  /// 批量读取（`list`）用的可降级版本：
-  /// `include_snapshot = false` 时快照为 `None`（调用方退回用 `output` 重放），
-  /// `include_journal = false` 时连 `output`/`chunks` 也省略。
-  /// `attach` 永远走完整版 —— 它是「重启后重建屏幕」的正规入口。
-  pub fn state_with_options(
-    &self,
-    after_seq: u64,
-    include_snapshot: bool,
-    include_journal: bool,
-  ) -> SessionState {
     let inner = lock(&self.state);
     SessionState {
       session_id: self.session_id.clone(),
@@ -297,29 +288,17 @@ impl Session {
       cols: inner.cols,
       rows: inner.rows,
       seq: inner.seq,
-      output: if include_journal {
-        inner.output.to_string_value()
-      } else {
-        String::new()
-      },
-      chunks: if include_journal {
-        inner
-          .chunks
-          .iter()
-          .filter(|(seq, _)| *seq > after_seq)
-          .map(|(seq, data)| Chunk {
-            data: data.to_string(),
-            seq,
-          })
-          .collect()
-      } else {
-        Vec::new()
-      },
-      terminal_snapshot: if include_snapshot {
-        Some(inner.snapshot_for_read())
-      } else {
-        None
-      },
+      output: inner.output.to_string_value(),
+      chunks: inner
+        .chunks
+        .iter()
+        .filter(|(seq, _)| *seq > after_seq)
+        .map(|(seq, data)| Chunk {
+          data: data.to_string(),
+          seq,
+        })
+        .collect(),
+      terminal_snapshot: Some(inner.snapshot_for_read()),
       launch_marker_token: self.launch_marker_token.clone(),
     }
   }
@@ -386,6 +365,10 @@ impl Session {
   }
 
   /// 信号名 → 信号，投递给**子进程所在的进程组**。
+  ///
+  /// 不传 signal 时期望的语义是「关闭终端」，所以默认值是 SIGHUP（协议 §9.4），
+  /// 与 node-pty 的 `kill()` 和 legacy daemon 一致。
+  #[cfg(unix)]
   pub fn kill(&self, signal_name: Option<&str>) -> Result<(), RenderError> {
     let signo = match signal_name {
       Some(name) if !name.trim().is_empty() => signal::number(name)
@@ -396,11 +379,23 @@ impl Session {
     Ok(())
   }
 
+  /// Windows / ConPTY 第一阶段不支持按信号投递，明确报错而不是静默无操作。
+  #[cfg(not(unix))]
+  pub fn kill(&self, _signal_name: Option<&str>) -> Result<(), RenderError> {
+    Err(RenderError::Internal(
+      "kill requires POSIX signals, which this platform does not implement yet (see docs/render-protocol.md §9.5.3)"
+        .to_string(),
+    ))
+  }
+
   /// 从注册表摘除：停止记录/广播，并回收 PTY 句柄与子进程（与 legacy
   /// `forget` 一样先送 SIGTERM）。
   pub fn retire(&self) {
     self.retired.store(true, Ordering::SeqCst);
+    #[cfg(unix)]
     kill_pid(self.pid, libc::SIGTERM);
+    // 非 Unix 没有信号，也没有保留 Child 句柄：Windows 要终止会话得改成
+    // 持有 ConPTY 句柄／Job Object，属于「第一阶段不支持」的范围（协议 §9.5.3）。
     // 关掉 master，客户端看到的会话状态不再变化；读取线程若仍阻塞在
     // 孙进程持有的 slave 上，会随进程退出一起结束。
     *lock(&self.master) = None;
@@ -539,6 +534,7 @@ impl Session {
 
 /// 投递信号：只有确认子进程是它自己进程组的组长时才用 `-pid`（forkpty 路径下
 /// 子进程已经 `setsid`），这样既能覆盖它拉起的子进程，又不会误伤 Render 自己。
+#[cfg(unix)]
 fn kill_pid(pid: u32, signo: i32) {
   if pid == 0 {
     return;
@@ -551,8 +547,21 @@ fn kill_pid(pid: u32, signo: i32) {
   }
 }
 
+/// spawn 失败时的兜底回收用 SIGKILL：此刻还不知道子进程初始化到哪一步，
+/// SIGHUP/SIGTERM 都可能被忽略而把进程留在机器上。
+#[cfg(unix)]
+fn force_kill(pid: u32) {
+  kill_pid(pid, libc::SIGKILL);
+}
+
+/// 非 Unix 没有信号，也没有可用的 pid 句柄（Windows 用 ConPTY 句柄与 Job Object）：
+/// 这一阶段的兜底回收交给 portable-pty 的句柄在 drop 时处理（协议 §9.5.3）。
+#[cfg(not(unix))]
+fn force_kill(_pid: u32) {}
+
 /// 直接 `waitpid` 拿原始状态：portable-pty 的 `ExitStatus::signal()` 返回的是
 /// `strsignal` 描述（"Killed: 9"），换不回信号编号，而协议要的是编号。
+#[cfg(unix)]
 fn wait_for_child(mut child: Box<dyn Child + Send + Sync>) -> ChildExit {
   let pid = child.process_id().unwrap_or(0);
   if pid == 0 {
@@ -589,6 +598,7 @@ fn wait_for_child(mut child: Box<dyn Child + Send + Sync>) -> ChildExit {
 }
 
 /// POSIX wait 状态解码（`0x7f` 低位的规范编码，Linux 与 macOS 一致）。
+#[cfg(unix)]
 fn decode_wait_status(status: libc::c_int) -> ChildExit {
   let raw = status & 0xffff;
   let term_signal = raw & 0x7f;
@@ -611,6 +621,23 @@ fn decode_wait_status(status: libc::c_int) -> ChildExit {
   }
 }
 
+/// 非 Unix（Windows / ConPTY）：等 portable-pty 的 `Child::wait` 返回。
+/// 没有 signal 语义，只能报退出码。
+#[cfg(not(unix))]
+fn wait_for_child(mut child: Box<dyn Child + Send + Sync>) -> ChildExit {
+  match child.wait() {
+    Ok(status) => ChildExit {
+      exit_code: Some(status.exit_code() as i32),
+      signal: None,
+    },
+    // 拿不到状态就照实报告「未知」，不编造退出码。
+    Err(_) => ChildExit {
+      exit_code: None,
+      signal: None,
+    },
+  }
+}
+
 /// 每次新建 PTY 生成一次的实例标识（attach 不改变）。
 fn new_incarnation_id() -> String {
   use std::sync::atomic::AtomicU64;
@@ -629,6 +656,7 @@ mod tests {
   use super::*;
 
   #[test]
+  #[cfg(unix)]
   fn wait_status_decoding() {
     assert_eq!(decode_wait_status(0).exit_code, Some(0));
     assert_eq!(decode_wait_status(0).signal, None);
@@ -648,6 +676,7 @@ mod tests {
   }
 
   #[test]
+  #[cfg(unix)]
   fn signal_delivery_rejects_unknown_names() {
     // 只验证错误分支：真正的投递在 PTY 集成测试里覆盖。
     assert!(signal::number("SIGBREAKFAST").is_none());

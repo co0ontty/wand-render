@@ -1,35 +1,58 @@
 //! `wand-render`：常驻 Render 守护进程。
 //!
-//! 生命周期（`docs/render-protocol.md` §6）：
+//! 生命周期（`docs/render-protocol.md` §6 / §9.3）：
 //! - socket / token / pid / meta 全部按 config 路径派生，与 legacy `terminald`
 //!   命名空间**刻意不同**，升级期两套并存但不互相领养；
 //! - 忽略 SIGHUP（脱离父进程后终端关闭不影响 Render）；
-//! - SIGTERM 优雅退出（等价 `shutdown { mode: "drain" }`：不杀运行中的 PTY）。
+//! - SIGTERM/SIGINT 等价 `shutdown { mode: "drain" }`：停止接受新会话，但**保留**
+//!   运行中的 PTY、进程继续存活，最后一个会话退出后自行结束；第二次信号 == `now`。
 
 mod args;
+#[cfg(unix)]
 mod server;
 
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::net::UnixListener;
 use std::path::Path;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender};
+#[cfg(unix)]
+use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, SyncSender};
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+#[cfg(unix)]
+use anyhow::Context;
+#[cfg(unix)]
+use wand_render::security::{self, ExistingSocket};
+#[cfg(unix)]
 use wand_render::{render_paths, RenderPaths, RenderRegistry};
-use wand_render_protocol::{ShutdownMode, RENDER_PROTOCOL_VERSION};
+use wand_render_protocol::RENDER_PROTOCOL_VERSION;
+#[cfg(unix)]
+use wand_render_protocol::ShutdownMode;
 
+#[cfg(unix)]
 use crate::server::{generate_token, ClientHub, HubSink, RenderServer};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// 退出前留给响应/事件冲刷的时间。
+#[cfg(unix)]
 const EXIT_FLUSH_DELAY: Duration = Duration::from_millis(150);
 
+/// drain 期间「最后一个会话是否已退出」的检查间隔。
+#[cfg(unix)]
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
 /// 信号处理器只能做 async-signal-safe 的事，所以只往这个 fd 写一个字节。
+#[cfg(unix)]
 static SHUTDOWN_SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
 
 fn main() {
@@ -45,16 +68,28 @@ fn run() -> Result<()> {
       // 带上协议版本：打包脚本据此断言「二进制自报的协议版本」与源码常量一致。
       // 只报 crate 版本时，协议常量解析错误（例如把 `u32` 里的 32 当成版本号）无法被发现。
       println!("wand-render {VERSION} (protocol {RENDER_PROTOCOL_VERSION})");
-      return Ok(());
+      Ok(())
     }
     args::Command::Help => {
       print!("{}", args::HELP);
-      return Ok(());
+      Ok(())
     }
     args::Command::Run { config_path } => serve(&config_path),
   }
 }
 
+/// 非 Unix（Windows）：第一阶段不支持，入口就给出明确说明，
+/// 而不是编译失败或运行到一半神秘崩溃（协议 §9.5.1）。
+#[cfg(not(unix))]
+fn serve(config_path: &Path) -> Result<()> {
+  let _ = config_path;
+  Err(anyhow!(
+    "{}",
+    wand_render::paths::WINDOWS_UNSUPPORTED_MESSAGE
+  ))
+}
+
+#[cfg(unix)]
 fn serve(config_path: &Path) -> Result<()> {
   let paths = render_paths(config_path);
 
@@ -68,25 +103,15 @@ fn serve(config_path: &Path) -> Result<()> {
   std::fs::create_dir_all(paths.config_dir())
     .with_context(|| format!("failed to create {}", paths.config_dir().display()))?;
 
-  // 3. 单实例：socket 还能连上就绝不抢。
-  if socket_is_live(&paths.socket_path) {
-    return Err(anyhow!(
-      "another Render is already listening on {}",
-      paths.socket_path.display()
-    ));
-  }
-  // 4. 陈旧 socket 残留会让 bind 失败，先清掉。
-  if paths.socket_path.exists() {
-    std::fs::remove_file(&paths.socket_path)
-      .with_context(|| format!("failed to remove stale {}", paths.socket_path.display()))?;
-  }
+  // 3. 单实例：socket 还能连上就绝不抢；路径不属于本用户时拒绝启动（协议 §9.5.2）。
+  prepare_socket_path(&paths.socket_path)?;
 
   let listener = UnixListener::bind(&paths.socket_path)
     .with_context(|| format!("failed to bind {}", paths.socket_path.display()))?;
   std::fs::set_permissions(&paths.socket_path, std::fs::Permissions::from_mode(0o600))
     .context("failed to chmod the render socket")?;
 
-  // 5. bind 成功之后才发布凭据/元数据：并发的第二个进程不会覆盖活着的 Render。
+  // 4. bind 成功之后才发布凭据/元数据：并发的第二个进程不会覆盖活着的 Render。
   let token = generate_token().context("failed to generate the render token")?;
   write_private(&paths.token_path, token.as_bytes(), 0o600)?;
   write_private(
@@ -101,11 +126,7 @@ fn serve(config_path: &Path) -> Result<()> {
     "startedAt": wand_render::time::iso8601_now(),
     "sessions": 0,
   });
-  write_private(
-    &paths.meta_path,
-    format!("{meta}\n").as_bytes(),
-    0o644,
-  )?;
+  write_private(&paths.meta_path, format!("{meta}\n").as_bytes(), 0o644)?;
 
   let hub = ClientHub::new();
   let shutdown_channel = install_shutdown_signals()?;
@@ -129,34 +150,7 @@ fn serve(config_path: &Path) -> Result<()> {
     std::process::id()
   );
 
-  // `drain` 的协议定义是「停止接受新会话，已退出会话释放，**运行中会话保留**」
-  // （docs/render-protocol.md §6），所以它必须让进程继续活着 —— 一旦主线程返回，
-  // PTY master fd 关闭，所有子进程收 SIGHUP 死掉，「保留运行中会话」就成了空话。
-  //
-  // 退出规则：**已经处于 drain 状态时再收到一次 drain 请求（SIGTERM/SIGINT 或
-  // `shutdown {mode:"drain"}` 都算）就升级为 now**，杀掉 PTY 并退出。
-  // 于是“连按两次 Ctrl-C / kill 两次”就能真正停掉一个已 drain 的 Render。
-  let mode = loop {
-    match shutdown_channel.1.recv() {
-      Ok(ShutdownMode::Drain) => {
-        if registry.is_shutting_down() {
-          eprintln!("wand-render already drained; treating this request as `now` and stopping");
-          registry.begin_shutdown(ShutdownMode::Now);
-          break ShutdownMode::Now;
-        }
-        registry.begin_shutdown(ShutdownMode::Drain);
-        eprintln!(
-          "wand-render drained: no new sessions will be accepted, running sessions keep their PTYs;"
-        );
-        eprintln!("send SIGTERM again (or `shutdown {{mode:\"now\"}}`) to stop it for real");
-        continue;
-      }
-      Ok(ShutdownMode::Now) | Err(_) => {
-        registry.begin_shutdown(ShutdownMode::Now);
-        break ShutdownMode::Now;
-      }
-    }
-  };
+  let mode = shutdown_loop(&registry, &shutdown_channel.1);
   // 给 shutdown 响应与最后一个事件一点出场时间，然后收摊。
   std::thread::sleep(EXIT_FLUSH_DELAY);
   registry.stop_maintenance();
@@ -165,12 +159,101 @@ fn serve(config_path: &Path) -> Result<()> {
   Ok(())
 }
 
+/// 关闭决策循环（协议 §9.3）。
+///
+/// 返回值是最终模式：`Drain` = 最后一个会话已退出、自然收摊；`Now` = 杀掉所有 PTY
+/// 立刻退出。要点：
+///
+/// - `drain` **不能结束进程**：主线程一旦返回，PTY master fd 就被关掉，子进程收
+///   SIGHUP 全死，「保留运行中会话」变成空话。所以这里只置位 shutting_down，
+///   把「停止接受新会话」交给 registry，然后等运行中的会话自己退完。
+/// - 已经是 drain 状态时再来一次请求（信号或 `shutdown{drain}`）才升级为 `now`，
+///   这是唯一的强杀出口。
+#[cfg(unix)]
+fn shutdown_loop(registry: &RenderRegistry, requests: &Receiver<ShutdownMode>) -> ShutdownMode {
+  loop {
+    match requests.recv_timeout(DRAIN_POLL_INTERVAL) {
+      Ok(ShutdownMode::Drain) => {
+        if registry.is_shutting_down() {
+          eprintln!("wand-render already drained; treating this request as `now` and stopping");
+          registry.begin_shutdown(ShutdownMode::Now);
+          return ShutdownMode::Now;
+        }
+        registry.begin_shutdown(ShutdownMode::Drain);
+        eprintln!(
+          "wand-render drained: no new sessions will be accepted, running sessions keep their PTYs"
+        );
+        eprintln!("send SIGTERM again (or `shutdown {{\"mode\":\"now\"}}`) to stop it for real");
+        // 一个运行中的会话都没有：没有什么可以保留，直接收摊。
+        if registry.running_session_count() == 0 {
+          return ShutdownMode::Drain;
+        }
+      }
+      Ok(ShutdownMode::Now) => {
+        registry.begin_shutdown(ShutdownMode::Now);
+        return ShutdownMode::Now;
+      }
+      Err(RecvTimeoutError::Timeout) => {
+        if registry.is_shutting_down() && registry.running_session_count() == 0 {
+          eprintln!("wand-render drained: the last session exited; stopping");
+          return ShutdownMode::Drain;
+        }
+      }
+      // 信号线程消失（几乎不可能）：不知道还能不能收到请求，按 now 收摊。
+      Err(RecvTimeoutError::Disconnected) => {
+        registry.begin_shutdown(ShutdownMode::Now);
+        return ShutdownMode::Now;
+      }
+    }
+  }
+}
+
+/// bind 之前的 socket 归属校验（协议 §9.5.2）。
+///
+/// socket 落在全局可写的 `/tmp`，任何本机进程都能抢先 `bind` 同名路径，所以：
+///
+/// - 路径不存在 → 直接 bind；
+/// - 是本用户的 0600 socket 且有人在 listen → 已经有 Render，拒绝启动；
+/// - 是本用户的 0600 socket 但连不上 → 崩溃留下的陈旧残留，删掉重建；
+/// - 其他任何情况（普通文件、符号链接、别人的 socket、权限过宽）→ **拒绝启动**，
+///   绝不 unlink 不属于自己的路径。
+#[cfg(unix)]
+fn prepare_socket_path(socket_path: &Path) -> Result<()> {
+  match security::inspect_socket_path(socket_path) {
+    ExistingSocket::Absent => Ok(()),
+    ExistingSocket::Owned => {
+      if socket_is_live(socket_path) {
+        return Err(anyhow!(
+          "another Render is already listening on {}",
+          socket_path.display()
+        ));
+      }
+      std::fs::remove_file(socket_path).with_context(|| {
+        format!(
+          "failed to remove the stale socket {}",
+          socket_path.display()
+        )
+      })?;
+      Ok(())
+    }
+    ExistingSocket::Foreign(reason) => Err(anyhow!(
+      "refusing to start: {} already exists but {reason}; wand-render never unlinks a path it does not own \
+       (verify it is not another user's socket, then move it aside)",
+      socket_path.display()
+    )),
+  }
+}
+
 /// 安装 SIGTERM/SIGINT 优雅退出（SIGHUP 已在 [`ignore_sighup`] 里忽略），
 /// 返回 (发送端, 接收端)。
 ///
 /// SIGTERM 语义：每次信号都请求 drain（不杀运行中的 PTY，进程继续服务 attach）；
-/// 已经 drain 之后再收到一次请求才升级为 now。见 [`serve`] 里的主循环。
-fn install_shutdown_signals() -> Result<(SyncSender<ShutdownMode>, std::sync::mpsc::Receiver<ShutdownMode>)> {
+/// 已经 drain 之后再收到一次请求才升级为 now。见 [`shutdown_loop`]。
+#[cfg(unix)]
+fn install_shutdown_signals() -> Result<(
+  SyncSender<ShutdownMode>,
+  std::sync::mpsc::Receiver<ShutdownMode>,
+)> {
   let (read_fd, write_fd) = create_pipe()?;
   SHUTDOWN_SIGNAL_FD.store(write_fd, Ordering::SeqCst);
 
@@ -183,8 +266,8 @@ fn install_shutdown_signals() -> Result<(SyncSender<ShutdownMode>, std::sync::mp
   }
 
   let (sender, receiver) = sync_channel(4);
-  // 信号只写一个字节，每次都当作 drain 交给主线程；“已 drain ⇒ 升级为 now”的
-  // 逃逸逻辑在主循环里（见 [`serve`]），信号线程不需要自己计数。
+  // 信号只写一个字节，每次都当作 drain 交给主循环；“已 drain ⇒ 升级为 now”的
+  // 逃逸逻辑在 [`shutdown_loop`] 里，信号线程不需要自己计数。
   let signal_sender = sender.clone();
   std::thread::Builder::new()
     .name("wand-render-signals".into())
@@ -212,6 +295,7 @@ fn install_shutdown_signals() -> Result<(SyncSender<ShutdownMode>, std::sync::mp
   Ok((sender, receiver))
 }
 
+#[cfg(unix)]
 extern "C" fn on_shutdown_signal(_signal: libc::c_int) {
   let fd = SHUTDOWN_SIGNAL_FD.load(Ordering::SeqCst);
   if fd >= 0 {
@@ -223,6 +307,7 @@ extern "C" fn on_shutdown_signal(_signal: libc::c_int) {
   }
 }
 
+#[cfg(unix)]
 fn ignore_sighup() {
   unsafe {
     let mut ignore: libc::sigaction = std::mem::zeroed();
@@ -231,6 +316,7 @@ fn ignore_sighup() {
   }
 }
 
+#[cfg(unix)]
 fn create_pipe() -> Result<(libc::c_int, libc::c_int)> {
   let mut fds = [0 as libc::c_int; 2];
   let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
@@ -244,6 +330,7 @@ fn create_pipe() -> Result<(libc::c_int, libc::c_int)> {
 }
 
 /// socket 上还有活的 Render 吗？（陈旧 socket 文件会 connect 失败。）
+#[cfg(unix)]
 fn socket_is_live(socket_path: &Path) -> bool {
   if !socket_path.exists() {
     return false;
@@ -258,6 +345,7 @@ fn socket_is_live(socket_path: &Path) -> bool {
   }
 }
 
+#[cfg(unix)]
 fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
   let mut file = std::fs::OpenOptions::new()
     .write(true)
@@ -275,6 +363,7 @@ fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
   Ok(())
 }
 
+#[cfg(unix)]
 fn cleanup(paths: &RenderPaths) {
   for path in [
     &paths.socket_path,
@@ -286,9 +375,16 @@ fn cleanup(paths: &RenderPaths) {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
   use super::*;
+  use std::collections::BTreeMap;
+  use std::sync::Arc;
+  use std::time::{Duration, Instant};
+
+  use wand_render::sink::NullSink;
+  use wand_render::RenderError;
+  use wand_render_protocol::CreateOrAttachParams;
 
   #[test]
   fn socket_liveness_probe_handles_missing_paths() {
@@ -297,8 +393,7 @@ mod tests {
 
   #[test]
   fn write_private_sets_the_requested_mode() {
-    let dir = std::env::temp_dir().join(format!("wand-render-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = test_dir("write-private");
     let path = dir.join("token");
     write_private(&path, b"secret\n", 0o600).expect("write");
     let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
@@ -306,5 +401,177 @@ mod tests {
     let contents = std::fs::read_to_string(&path).expect("read");
     assert_eq!(contents, "secret\n");
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// §9.5.2：路径已被别人占用（普通文件 / 符号链接 / 权限过宽）时拒绝启动，
+  /// 而且**不能**动那个文件。
+  #[test]
+  fn prepare_socket_path_refuses_foreign_paths_without_removing_them() {
+    let dir = test_dir("foreign");
+    let path = dir.join("wand-render.sock");
+    std::fs::write(&path, b"someone else's file").expect("write");
+    let error = prepare_socket_path(&path).expect_err("a regular file must be refused");
+    assert!(
+      error.to_string().contains("not a unix socket"),
+      "unhelpful error: {error}"
+    );
+    assert!(path.exists(), "the daemon must not unlink what it does not own");
+
+    let target = dir.join("target.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&target).expect("bind");
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let link = dir.join("link.sock");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    assert!(prepare_socket_path(&link).is_err());
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// 活得着的 Render 必须拒绝启动而不是抢 socket。
+  #[test]
+  fn prepare_socket_path_refuses_when_a_render_is_listening() {
+    let dir = test_dir("live");
+    let path = dir.join("wand-render.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let error = prepare_socket_path(&path).expect_err("a live listener must be respected");
+    assert!(
+      error.to_string().contains("already listening"),
+      "unhelpful error: {error}"
+    );
+    assert!(path.exists());
+    drop(listener);
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// 本用户 0600 的陈旧 socket（进程已死）可以回收重建。
+  #[test]
+  fn prepare_socket_path_reclaims_a_stale_own_socket() {
+    let dir = test_dir("stale");
+    let path = dir.join("wand-render.sock");
+    {
+      let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+      std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+      drop(listener);
+    }
+    assert!(path.exists(), "a dropped listener leaves the socket file behind");
+    prepare_socket_path(&path).expect("a stale own socket must be reclaimed");
+    assert!(!path.exists(), "the stale socket must be removed before bind");
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  /// 没有运行中会话时，drain 立刻收摊（没有东西需要保留）。
+  #[test]
+  fn shutdown_loop_stops_immediately_when_nothing_is_running() {
+    let registry = RenderRegistry::new("test", Arc::new(NullSink));
+    let (sender, receiver) = sync_channel(1);
+    sender.send(ShutdownMode::Drain).expect("request");
+    assert_eq!(shutdown_loop(&registry, &receiver), ShutdownMode::Drain);
+    assert!(registry.is_shutting_down());
+    registry.stop_maintenance();
+  }
+
+  /// §9.3：drain 后进程必须继续活着、拒绝新会话；最后一个会话退出才收摊。
+  #[test]
+  fn shutdown_loop_keeps_running_until_the_last_session_exits() {
+    let registry = running_registry();
+    let (sender, receiver) = sync_channel(2);
+    sender.send(ShutdownMode::Drain).expect("request");
+    let loop_registry = Arc::clone(&registry);
+    let handle = std::thread::spawn(move || shutdown_loop(&loop_registry, &receiver));
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+      !handle.is_finished(),
+      "drain must not end the daemon while a PTY is still running"
+    );
+    assert!(registry.is_shutting_down());
+    assert_eq!(registry.running_session_count(), 1);
+    // 新会话被拒（协议 §9.3）。
+    assert!(matches!(
+      registry.create_or_attach(&session_params("late")),
+      Err(RenderError::Conflict(_))
+    ));
+
+    registry.kill("life", Some("SIGKILL")).expect("kill");
+    assert!(
+      wait_until(Duration::from_secs(5), || handle.is_finished()),
+      "the daemon must stop once the last session exited"
+    );
+    assert_eq!(handle.join().expect("join"), ShutdownMode::Drain);
+    registry.stop_maintenance();
+  }
+
+  /// §9.3：第二次 drain 请求（信号也是走这条路）升级为 now，PTY 被杀掉。
+  #[test]
+  fn second_drain_request_escalates_to_now() {
+    let registry = running_registry();
+    let (sender, receiver) = sync_channel(2);
+    sender.send(ShutdownMode::Drain).expect("first request");
+    sender.send(ShutdownMode::Drain).expect("second request");
+    assert_eq!(shutdown_loop(&registry, &receiver), ShutdownMode::Now);
+    assert_eq!(registry.running_session_count(), 0);
+    assert!(registry.session_count() == 0);
+    registry.stop_maintenance();
+  }
+
+  /// `shutdown { mode: "now" }` 直接收摊，不等会话退出。
+  #[test]
+  fn now_request_stops_immediately() {
+    let registry = running_registry();
+    let (sender, receiver) = sync_channel(1);
+    sender.send(ShutdownMode::Now).expect("request");
+    assert_eq!(shutdown_loop(&registry, &receiver), ShutdownMode::Now);
+    assert_eq!(registry.running_session_count(), 0);
+    registry.stop_maintenance();
+  }
+
+  fn test_dir(tag: &str) -> std::path::PathBuf {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let dir = std::env::temp_dir().join(format!(
+      "wand-renderd-{tag}-{}-{}",
+      std::process::id(),
+      COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    dir
+  }
+
+  fn session_params(session_id: &str) -> CreateOrAttachParams {
+    CreateOrAttachParams {
+      session_id: session_id.to_string(),
+      file: "/bin/sh".to_string(),
+      args: vec!["-c".to_string(), "sleep 30".to_string()],
+      cwd: std::env::temp_dir().to_string_lossy().to_string(),
+      env: BTreeMap::new(),
+      name: "xterm-256color".to_string(),
+      cols: 80,
+      rows: 24,
+      launch_marker_token: None,
+      after_seq: 0,
+    }
+  }
+
+  /// 一个持有运行中 PTY（`sleep 30`）的 registry。
+  fn running_registry() -> Arc<RenderRegistry> {
+    let registry = RenderRegistry::new("test", Arc::new(NullSink));
+    registry
+      .create_or_attach(&session_params("life"))
+      .expect("create");
+    assert_eq!(registry.running_session_count(), 1);
+    registry
+  }
+
+  fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut condition: F) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+      if condition() {
+        return true;
+      }
+      if Instant::now() >= deadline {
+        return false;
+      }
+      std::thread::sleep(Duration::from_millis(10));
+    }
   }
 }

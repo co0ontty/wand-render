@@ -69,15 +69,15 @@
 | --- | --- | --- |
 | `hello` | — | `{ version, protocolVersion, pid, startedAt, sessions }` |
 | `ping` | — | `{ pong: true }` |
-| `list` | — | `{ sessions: SessionState[] }` |
-| `attach` | `{ sessionId, afterSeq? }` | `{ state: SessionState }`；未知 session → `notFound` |
+| `list` | — | `{ sessions: SessionState[] }`（快照有界，见 §9.1） |
+| `attach` | `{ sessionId, afterSeq? }` | `{ state: SessionState }`（完整快照）；未知 session → `notFound` |
 | `createOrAttach` | `{ sessionId, file, args[], cwd, env{}, name, cols, rows, launchMarkerToken?, afterSeq? }` | `{ state, isNew }` |
 | `write` | `{ sessionId, data }` | `{}` |
 | `resize` | `{ sessionId, cols, rows }` | `{}` |
 | `kill` | `{ sessionId, signal? }` | `{}` |
 | `forget` | `{ sessionId }` | `{}` |
 | `stats` | — | `{ uptimeMs, sessions, liveBytes, rssBytes }` |
-| `shutdown` | `{ mode: "drain" \| "now" }` | `{}`（为 Render 自身升级预留） |
+| `shutdown` | `{ mode: "drain" \| "now" }` | `{}`（语义见 §9.3） |
 
 `createOrAttach` 语义：
 
@@ -173,3 +173,81 @@ interface TerminalSnapshot {
 - 不做跨机器 Render 连接（只允许本机 socket）。
 - 不在 Render 内做聊天/权限/DB/HTTP。
 - 不改变对客户端的 WS 契约（`init`/`output`/`ping`/`resync_required`/`pty_error` 不变）。
+
+---
+
+## 9. 发布前修订（v1）
+
+v1 **尚未随任何 npm 版本发布**。在第一次发布之前，本协议允许就地修订；一旦发布过，
+任何语义变更都必须提升 `RENDER_PROTOCOL_VERSION` 并同步两侧常量与本文。
+
+### 9.1 `list` 的快照必须有界，`attach` 才是权威再同步原语
+
+触发过的问题：`list` 内联每个会话的完整输出、chunk 窗口与 5000 行回滚快照，
+单个 1000 列会话的状态可达 5MB；十几个会话就让响应撞上 64MiB 单帧上限，
+而超限的帧被静默丢弃 → 客户端只看到 10s 超时。
+
+规则：
+
+**§9.1.1** `list` 返回的 `terminalSnapshot` **必须做有界裁剪**（序列化后不超过 64KiB），
+   用于列表显示与「有/无屏幕」判断；`output` / `chunks` 仍按 §4 的上限。
+   裁剪顺序固定，两侧行为一致：完整快照够小就原样返回 → 否则先丢 `pending`
+   （它是基线之后的增量，丢了只是预览略旧）→ 仍超限就截断 `data` 成前缀
+   （前缀必须收在完整的转义序列处，绝不能留下未收尾的 `ESC`，否则客户端终端
+   会一直等这条序列的收尾而吞掉后续真实输出）→ 连元信息都放不下则置空 `null`。
+   因此 `list` 里的快照**不是**屏幕等价的预览。
+**§9.1.2** **`attach` 是唯一权威的再同步原语**：需要精确重建屏幕的调用方（Server 重启后的
+   恢复路径）必须走 `attach`，不能依赖 `list` 里的裁剪快照。
+**§9.1.3** 任何请求的响应在编码后仍超过 `MAX_FRAME_BYTES` 时，**必须回一个 `internal` 错误帧并说明原因**，
+   绝不静默丢弃该响应（静默丢弃会把内部错误伪装成网络超时）。
+4. `createOrAttach` 与 `attach` 返回的 `state` 是完整的（不受 §9.1.1 的裁剪约束）。
+
+### 9.2 路径必须 realpath 归一化
+
+`<suffix>` 必须基于 **canonicalize（realpath 后）** 的 config 路径计算，而不是词法 `path.resolve`。
+否则同一个 config 经符号链接或不同写法访问会派生两套 socket/token/pid，产生两个 Render，
+PTY 所有权分裂。两侧实现必须使用同一算法，顺序也要一致：
+
+1. 先词法绝对化并归一 `.`/`..`（Node：`path.resolve`；Rust：`lexical_absolute`）；
+2. 再对第 1 步的结果做 `canonicalize`（Node：`fs.realpathSync`；Rust：`std::fs::canonicalize`），
+   成功就用它的结果；
+3. `canonicalize` 失败（路径还不存在，例如首次启动）就停在词法结果上。
+
+顺序不能颠倒：直接对原始路径 `canonicalize` 会在「`..` 前面是符号链接」时给出内核语义
+（`..` = 符号链接目标的父目录）从而与 Node 分叉。
+
+第 3 条同时意味着「文件此刻是否存在」会决定走哪条分支，而两者在符号链接路径上结论不同
+（macOS 的 `/tmp` 是 `/private/tmp` 的符号链接）：同一个 config 在文件创建前与创建后会
+得到两个 suffix。所以调用方必须在**同一个时刻**用同一份归一化路径去派生与连接，不要
+一半走 realpath、一半走词法。
+
+### 9.3 `shutdown` 语义
+
+- `drain`：**停止接受新会话（新 `createOrAttach` 返回 `conflict`），但进程继续存活**，
+  已运行会话不受影响；当最后一个会话退出时自行结束（一个运行中会话都没有时立即结束）。
+- `now`：杀掉所有 PTY 后退出。
+- 收到 SIGTERM/SIGINT 等价于 `drain`；第二次信号等价于 `now`。
+
+旧实现里任何 shutdown 都会立刻退出进程，而进程退出会关闭 PTY master fd 并让子进程收到 SIGHUP
+——也就是说 `drain` 在旧实现里等于杀 PTY，与本文承诺相反。这条必须按上述语义修正。
+
+### 9.4 `kill` 的默认信号
+
+默认信号是 **SIGHUP**，对齐 node-pty 的 `kill()` 与 legacy daemon 行为。
+调用方不传 `signal` 时期望的行为是「关闭终端」，不是「礼貌请进程退出」，两者对 TUI 与
+前台作业的可见结果不同（SIGTERM 会被许多 TUI 当作可忽略/清理信号）。
+
+### 9.5 跨平台与连接方身份校验
+
+**§9.5.1** **传输**：Unix 用 domain socket；Windows 用命名管道（`\\.\pipe\wand-render-<suffix>`）。
+   Windows 第一阶段不实现，但代码必须 `cfg` 拆分并对用户给出明确错误，不是编译失败。
+**§9.5.2** **socket 归属校验**：socket 放在 `/tmp`（macOS 路径长度上限约 104 字节）。因为 `/tmp` 全局可写，
+   任何本机进程都能抢先 `bind` 同名路径，所以：
+   - 服务端 accept 之后必须通过 `getpeereid()`（macOS）/ `SO_PEERCRED`（Linux）校验对端 uid == 自身 uid；
+   - 客户端连接后、发送 token **之前**，必须校验目标 socket 是 socket 类型、属主是自己、权限 0600；
+   - 两侧都不满足时拒绝通信，而不是把 token 交给对方。
+   - 服务端 **bind 之前**也要校验：路径已存在但不是「本用户的 0600 socket」时拒绝启动，
+     绝不 `unlink` 不属于自己的路径；只有「本用户的 0600 socket 且连不上」才算陈旧残留，可以删掉重建。
+**§9.5.3** **信号**：`SIGWINCH` 语义、进程组与会话创建只在 Unix 上有意义；Windows 分支要用
+   ConPTY 语义重写，不做「能编译就上线」的移植。
+**§9.5.4** **分发路径必须可执行**：产物经 npm/git 传输会丢可执行位。Render 启动前必须校验并按需 `chmod 0755`。

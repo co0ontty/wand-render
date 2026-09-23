@@ -7,13 +7,13 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
-use wand_render::{EventSink, RenderError, RenderErrorKind, RenderRegistry};
+use wand_render::{security, EventSink, RenderError, RenderErrorKind, RenderRegistry};
 use wand_render_protocol::{
   decode_frame, encode_frame, AttachParams, AttachResult, CreateOrAttachParams,
   ErrorBody, ErrorCode, Event, ForgetParams, KillParams,
@@ -189,10 +189,9 @@ impl HubSink {
 
 impl EventSink for HubSink {
   fn publish(&self, event: Event) {
-    match encode_frame(&event) {
-      Ok(frame) => self.hub.broadcast(frame),
-      // 事件编码失败只可能是内部类型问题，不能影响 PTY。
-      Err(_) => {}
+    // 事件编码失败只可能是内部类型问题，不能影响 PTY。
+    if let Ok(frame) = encode_frame(&event) {
+      self.hub.broadcast(frame);
     }
   }
 }
@@ -202,6 +201,9 @@ pub struct RenderServer {
   registry: Arc<RenderRegistry>,
   token: String,
   shutdown: SyncSender<ShutdownMode>,
+  /// 允许连接的对端 uid（协议 §9.5.2）。正常就是本进程 uid；单测把它改成别的
+  /// 值来伪造「别的用户连过来」的场景。
+  expected_peer_uid: AtomicU32,
 }
 
 impl RenderServer {
@@ -216,6 +218,7 @@ impl RenderServer {
       registry,
       token,
       shutdown,
+      expected_peer_uid: AtomicU32::new(security::current_uid()),
     })
   }
 
@@ -231,6 +234,16 @@ impl RenderServer {
   }
 
   fn accept_connection(self: &Arc<Self>, stream: UnixStream) {
+    // 协议 §9.5.2 的第一道闸：socket 派生在全局可写的 /tmp，抢注者 connect 之后
+    // 第一个 hello 就能拿到 token。所以身份校验必须在**读取任何字节之前**完成，
+    // 而且取不到凭据时要失败关闭。
+    if let Err(reason) =
+      security::ensure_peer_uid(&stream, self.expected_peer_uid.load(Ordering::SeqCst))
+    {
+      eprintln!("wand-render: rejected a connection before reading its token: {reason}");
+      let _ = stream.shutdown(std::net::Shutdown::Both);
+      return;
+    }
     let conn = self.hub.connect(stream);
     let server = Arc::clone(self);
     let read_conn = Arc::clone(&conn);
@@ -287,7 +300,11 @@ impl RenderServer {
           .get("id")
           .and_then(JsonValue::as_u64)
           .unwrap_or(0) as u32;
-        self.respond(conn, id, Err((ErrorCode::BadRequest, error.to_string())));
+        let method = value
+          .get("method")
+          .and_then(JsonValue::as_str)
+          .unwrap_or("unknown");
+        self.respond(conn, id, method, Err((ErrorCode::BadRequest, error.to_string())));
         return;
       }
     };
@@ -301,6 +318,7 @@ impl RenderServer {
       self.respond(
         conn,
         request.id,
+        &request.method,
         Err((
           ErrorCode::ProtocolMismatch,
           format!(
@@ -320,7 +338,7 @@ impl RenderServer {
     let result = match request.method.as_str() {
       "hello" => to_json(self.registry.hello()),
       "ping" => Ok(serde_json::json!({ "pong": true })),
-      "list" => self.list_with_budget(),
+      "list" => self.list_response(),
       "attach" => match parse_params::<AttachParams>(&params) {
         Ok(parsed) => match self.registry.attach(&parsed.session_id, parsed.after_seq) {
           Some(state) => to_json(AttachResult { state }),
@@ -378,50 +396,38 @@ impl RenderServer {
         format!("unsupported method {other}"),
       )),
     };
-    self.respond(conn, request.id, result);
+    self.respond(conn, request.id, &request.method, result);
   }
 
-  /// `list` 的响应体上限控制。
+  /// `list` 的响应体。
   ///
-  /// `list` 会内联每个会话的 `output` (≤20 万字符) + `chunks` (≤20 万字符) + 完整
-  /// 回滚快照（≤5000 行 × 列宽）：cols=1000 的满回滚会话单个状态就约 5MB，十几个
-  /// 就会撞上 64MiB 的单帧上限。撞上时**不能让客户端拿到超时/死连接** —— 那等于整
-  /// 个 daemon 无法被 adopt（`connect()` 必须先 `list`），`render.engine=rust` 会直
-  /// 接起不来。所以这里逐级降级：完整 → 丢快照 → 只留元信息，完整状态仍由 `attach`
-  /// 提供（协议 §1 里两个入口都是 SessionState 的来源）。
-  fn list_with_budget(&self) -> DispatchResult {
-    const ATTEMPTS: [(bool, bool); 3] = [(true, true), (false, true), (false, false)];
-    let mut last_error = String::from("unknown");
-    for (include_snapshot, include_journal) in ATTEMPTS {
-      let sessions = self
-        .registry
-        .list_with_options(include_snapshot, include_journal);
-      let value = match to_json(ListResult { sessions }) {
-        Ok(value) => value,
-        Err(error) => return Err(error),
-      };
-      match serde_json::to_vec(&value) {
-        Ok(body) if body.len() as u64 <= MAX_FRAME_BYTES as u64 => {
-          if !include_snapshot || !include_journal {
-            eprintln!(
-              "wand-render: list response exceeded MAX_FRAME_BYTES; degraded to snapshots={include_snapshot} journal={include_journal} (per-session full state stays available via attach)"
-            );
-          }
-          return Ok(value);
-        }
-        Ok(body) => last_error = format!("{} bytes", body.len()),
-        Err(error) => last_error = error.to_string(),
-      }
-    }
-    Err((
-      ErrorCode::Internal,
-      format!(
-        "list response exceeds MAX_FRAME_BYTES even without snapshots/journal ({last_error}); fetch sessions individually with attach"
-      ),
-    ))
+  /// 每个会话的快照已经由 `RenderRegistry::list_sessions` 按 §9.1.1 裁剪到 64KiB，
+  /// 这里只负责帧上限检查：`output`/`chunks` 不能再砍（§9.1.1 要求它们保持 §4 上限），
+  /// 所以真的放不下时回一个 `internal` 错误帧说明原因，让客户端调用方明确知道
+  /// 「太大」而不是干等 10s 超时（§9.1.3）。
+  fn list_response(&self) -> DispatchResult {
+    self.list_response_with_frame_budget(MAX_FRAME_BYTES as usize)
   }
 
-  fn respond(&self, conn: &Arc<ClientConn>, id: u32, result: DispatchResult) {
+  /// 帧上限可注入，单测用一个小预算就能走到超限分支（真造 140 个满会话不现实）。
+  fn list_response_with_frame_budget(&self, max_bytes: usize) -> DispatchResult {
+    let value = to_json(ListResult {
+      sessions: self.registry.list_sessions(),
+    })?;
+    match serde_json::to_vec(&value) {
+      Ok(body) if body.len() <= max_bytes => Ok(value),
+      Ok(body) => Err((
+        ErrorCode::Internal,
+        format!(
+          "list response is {} bytes, over the {max_bytes}-byte frame limit (MAX_FRAME_BYTES); fetch large session states individually with attach",
+          body.len()
+        ),
+      )),
+      Err(error) => Err((ErrorCode::Internal, error.to_string())),
+    }
+  }
+
+  fn respond(&self, conn: &Arc<ClientConn>, id: u32, method: &str, result: DispatchResult) {
     let response = match result {
       Ok(value) => Response {
         id,
@@ -451,7 +457,9 @@ impl RenderServer {
           result: None,
           error: Some(ErrorBody {
             code: ErrorCode::Internal,
-            message: format!("response frame could not be encoded: {error}"),
+            // 带上方法名与原始原因：客户端必须能区分「响应太大」与其他内部错误，
+            // 否则只能看到自己的 10s 超时（协议 §9.1.3）。
+            message: format!("{method} response could not be encoded as a frame: {error}"),
           }),
         };
         if let Ok(frame) = encode_frame(&fallback) {
@@ -557,37 +565,146 @@ mod tests {
   /// 否则客户端只会看到自己的 10s 超时，甚至以为 daemon 挂了。
   #[test]
   fn oversized_response_falls_back_to_an_internal_error_frame() {
+    let (server, registry, conn, mut client_side) = test_server();
+
+    let oversized = JsonValue::String("x".repeat(MAX_FRAME_BYTES as usize + 16));
+    server.respond(&conn, 42, "list", Ok(oversized));
+
+    let response = read_response(&mut client_side);
+    assert_eq!(response.id, 42);
+    assert!(!response.ok);
+    let message = response.error.expect("error body");
+    assert_eq!(message.code, ErrorCode::Internal);
+    // 说明原因：客户端要能看出是「帧太大」，而不是随便一个内部错误。
+    assert!(
+      message.message.contains("list") && message.message.contains("MAX_FRAME_BYTES"),
+      "unhelpful message: {}",
+      message.message
+    );
+    registry.stop_maintenance();
+  }
+
+  /// §9.1.3：`list` 响应超过单帧上限时必须报 `internal`，而不是砍掉 journal 静默降级。
+  #[test]
+  fn oversized_list_response_reports_an_internal_error() {
+    let (server, registry, conn, mut client_side) = test_server();
+    let error = server
+      .list_response_with_frame_budget(8)
+      .expect_err("a tiny budget must trip the frame limit");
+    assert_eq!(error.0, ErrorCode::Internal);
+    assert!(
+      error.1.contains("frame limit"),
+      "unhelpful message: {}",
+      error.1
+    );
+
+    // 整条路径：错误也会真的变成一个 internal 错误帧发到对端。
+    server.respond(&conn, 7, "list", Err(error));
+    let response = read_response(&mut client_side);
+    assert_eq!(response.id, 7);
+    assert!(!response.ok);
+    assert_eq!(response.error.expect("error body").code, ErrorCode::Internal);
+    registry.stop_maintenance();
+  }
+
+  #[test]
+  fn empty_list_response_is_ok() {
+    let (server, registry, _conn, _client) = test_server();
+    let value = server.list_response().expect("empty list");
+    assert_eq!(value["sessions"], JsonValue::Array(Vec::new()));
+    registry.stop_maintenance();
+  }
+
+  /// §9.5.2：uid 不符的连接必须在读到 token 之前就被关掉。
+  #[test]
+  fn foreign_peer_is_rejected_before_the_token_is_read() {
+    let (server, registry, _conn, _client_side) = test_server();
+    // 对端就是本进程，所以把期望值改成别的 uid 来伪造「另一个用户连过来」。
+    server
+      .expected_peer_uid
+      .store(security::current_uid().wrapping_add(1), Ordering::SeqCst);
+
+    let (peer, mut other) = UnixStream::pair().expect("socketpair");
+    // 必须在服务端关闭对端之前设好读超时：连接已被 shutdown 之后 macOS 会对
+    // `set_read_timeout` 报 EINVAL。
+    other
+      .set_read_timeout(Some(Duration::from_secs(5)))
+      .expect("read timeout");
+    server.accept_connection(peer);
+
+    // 送一个**完全合法**的请求：拒绝必须发生在鉴权之前，且不能有任何回复。
+    let request = Request {
+      id: 1,
+      token: "token".into(),
+      protocol_version: RENDER_PROTOCOL_VERSION,
+      method: "hello".into(),
+      params: None,
+    };
+    let _ = other.write_all(&encode_frame(&request).expect("encode"));
+    let mut buffer = [0u8; 64];
+    let read = other.read(&mut buffer).unwrap_or(0);
+    assert_eq!(read, 0, "a foreign peer must be disconnected without an answer");
+    registry.stop_maintenance();
+  }
+
+  /// 同 uid 的连接必须正常通过身份校验并拿到 hello 响应。
+  #[test]
+  fn same_uid_peer_is_served_after_the_identity_check() {
+    let (server, registry, _conn, _client) = test_server();
+    let (peer, mut other) = UnixStream::pair().expect("socketpair");
+    other
+      .set_read_timeout(Some(Duration::from_secs(5)))
+      .expect("read timeout");
+    server.accept_connection(peer);
+
+    let request = Request {
+      id: 5,
+      token: "token".into(),
+      protocol_version: RENDER_PROTOCOL_VERSION,
+      method: "hello".into(),
+      params: None,
+    };
+    other
+      .write_all(&encode_frame(&request).expect("encode"))
+      .expect("write");
+    let response = read_response(&mut other);
+    assert_eq!(response.id, 5);
+    assert!(response.ok, "same-uid peer must be served: {response:?}");
+    registry.stop_maintenance();
+  }
+
+  /// 测试用服务器：返回 (Arc<RenderServer>, registry, 已连接的服务端 conn, 客户端流)。
+  fn test_server() -> (
+    Arc<RenderServer>,
+    Arc<RenderRegistry>,
+    Arc<ClientConn>,
+    UnixStream,
+  ) {
     let hub = ClientHub::new();
-    let (server_side, mut client_side) = UnixStream::pair().expect("socketpair");
+    let (server_side, client_side) = UnixStream::pair().expect("socketpair");
     let conn = hub.connect(server_side);
     let registry = RenderRegistry::new("test", Arc::new(NullSink));
     let (shutdown, _shutdown_rx) = sync_channel(1);
     let server = RenderServer::new(Arc::clone(&hub), Arc::clone(&registry), "token".into(), shutdown);
+    (server, registry, conn, client_side)
+  }
 
-    let oversized = JsonValue::String("x".repeat(MAX_FRAME_BYTES as usize + 16));
-    server.respond(&conn, 42, Ok(oversized));
-
-    client_side
+  fn read_response(stream: &mut UnixStream) -> Response {
+    stream
       .set_read_timeout(Some(Duration::from_secs(5)))
       .expect("read timeout");
     let mut buffer = Vec::new();
     let mut chunk = [0u8; 4096];
-    while buffer.len() < 4 {
-      match client_side.read(&mut chunk) {
-        Ok(0) => break,
+    while decode_frame::<Response>(&buffer).expect("decode").is_none() {
+      match stream.read(&mut chunk) {
+        Ok(0) => panic!("connection closed before a response arrived"),
         Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-        Err(_) => break,
+        Err(error) => panic!("read failed: {error}"),
       }
     }
-    let (_, response) = decode_frame::<Response>(&buffer)
+    decode_frame::<Response>(&buffer)
       .expect("decode")
-      .expect("one complete frame");
-    assert_eq!(response.id, 42);
-    assert!(!response.ok);
-    assert_eq!(
-      response.error.expect("error body").code,
-      ErrorCode::Internal
-    );
-    registry.stop_maintenance();
+      .expect("one complete frame")
+      .1
   }
 }

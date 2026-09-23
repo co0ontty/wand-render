@@ -9,8 +9,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use wand_render::{EventSink, RenderRegistry};
-use wand_render_protocol::{CreateOrAttachParams, Event, SessionStatus, PTY_OUTPUT_MAX_CHARS};
+use wand_render::{EventSink, RenderError, RenderRegistry};
+use wand_render_protocol::{
+  CreateOrAttachParams, Event, SessionStatus, ShutdownMode, PTY_OUTPUT_MAX_CHARS,
+};
+use wand_render::snapshot::LIST_SNAPSHOT_MAX_BYTES;
 
 const SHELL: &str = "/bin/sh";
 const AWK: &str = "/usr/bin/awk";
@@ -625,4 +628,91 @@ fn resize_is_reflected_as_a_pending_operation_until_the_next_checkpoint() {
 fn awk_is_available_for_these_tests() {
   // 显式声明依赖：上面几个测试用 awk 生成可预期的输出量。
   assert!(std::path::Path::new(AWK).exists(), "{AWK} is required");
+}
+
+/// §9.1.1：`list` 的快照必须有界（序列化后 ≤ 64KiB），而 `attach` 仍返回完整状态。
+///
+/// 这里用「200 列 × 6000 行」造出真实的大回滚屏幕：journal 只保留尾 20 万字符，
+/// 但 VT 屏幕模型会留下 5000 行历史，快照因此远大于 64KiB —— 正是 `list` 撞上
+/// 单帧上限的那个形态。
+#[test]
+fn list_bounds_the_snapshot_while_attach_stays_complete() {
+  let (registry, sink) = registry();
+  let script = "awk 'BEGIN{for(i=0;i<6000;i++){for(j=0;j<200;j++)printf \"x\"; printf \"\\n\"}}'";
+  registry
+    .create_or_attach(&params("wide", &["-c", script], 200, 60))
+    .expect("create");
+  wait_for_exit(&sink, "wide");
+
+  let listed = registry.list_sessions();
+  assert_eq!(listed.len(), 1);
+  let listed = &listed[0];
+  let listed_snapshot = listed
+    .terminal_snapshot
+    .as_ref()
+    .expect("list keeps a bounded snapshot hint");
+  let listed_bytes = serde_json::to_vec(listed_snapshot).expect("json").len();
+  assert!(
+    listed_bytes <= LIST_SNAPSHOT_MAX_BYTES,
+    "list snapshot grew to {listed_bytes} bytes"
+  );
+
+  let full = registry.attach("wide", 0).expect("attach");
+  let full_snapshot = full.terminal_snapshot.as_ref().expect("snapshot");
+  let full_bytes = serde_json::to_vec(full_snapshot).expect("json").len();
+  assert!(
+    full_bytes > LIST_SNAPSHOT_MAX_BYTES,
+    "attach must return the unbounded snapshot, got only {full_bytes} bytes"
+  );
+  // output / chunks 不受快照裁剪影响（§9.1.1：仍按 §4 的上限）。
+  assert!(listed.output.chars().count() <= PTY_OUTPUT_MAX_CHARS);
+  assert_eq!(listed.output, full.output);
+  assert_eq!(listed.chunks.len(), full.chunks.len());
+  assert_eq!(listed.status, full.status);
+  registry.forget("wide");
+}
+
+/// §9.4：不传 signal 时投递 SIGHUP（「关闭终端」语义），不是 SIGTERM。
+#[test]
+fn kill_without_a_signal_uses_sighup() {
+  let (registry, sink) = registry();
+  registry
+    .create_or_attach(&params("hup", &["-c", "sleep 30"], 80, 24))
+    .expect("create");
+  std::thread::sleep(Duration::from_millis(150));
+  registry.kill("hup", None).expect("kill");
+  let (exit_code, signal) = wait_for_exit(&sink, "hup");
+  assert_eq!(
+    signal,
+    Some(libc::SIGHUP),
+    "the default kill signal must be SIGHUP (protocol §9.4)"
+  );
+  assert_eq!(exit_code, None);
+  registry.forget("hup");
+}
+
+/// §9.3：drain 不杀运行中的 PTY、不接受新会话；`now` 才杀掉全部。
+#[test]
+fn drain_keeps_running_sessions_and_refuses_new_ones() {
+  let (registry, sink) = registry();
+  registry
+    .create_or_attach(&params("keep", &["-c", "sleep 30"], 80, 24))
+    .expect("create");
+  registry.begin_shutdown(ShutdownMode::Drain);
+  assert!(registry.is_shutting_down());
+  assert_eq!(registry.running_session_count(), 1);
+  let state = registry.attach("keep", 0).expect("attach");
+  assert_eq!(state.status, SessionStatus::Running);
+  assert!(matches!(
+    registry.create_or_attach(&params("new", &["-c", "true"], 80, 24)),
+    Err(RenderError::Conflict(_))
+  ));
+
+  // now：杀掉所有 PTY。
+  registry.begin_shutdown(ShutdownMode::Now);
+  assert_eq!(registry.session_count(), 0);
+  assert_eq!(registry.running_session_count(), 0);
+  let (_, signal) = wait_for_exit(&sink, "keep");
+  assert_eq!(signal, Some(libc::SIGKILL));
+  registry.stop_maintenance();
 }

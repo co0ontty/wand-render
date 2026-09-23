@@ -1,14 +1,18 @@
 //! 常驻进程的内存指标（`stats.rssBytes` / `stats.liveBytes`）。
 //!
 //! liveBytes 由 registry 汇总各会话 journal 的字节数；这里只负责 RSS：
-//! Linux 读 `/proc/self/statm`，其他平台退化成 `getrusage` 的峰值常驻集
+//! Linux 读 `/proc/self/statm`，其他 Unix 退化成 `getrusage` 的峰值常驻集
 //! （daemon 常驻、内存平稳，峰值与当前值差距很小，够用且不需要 mach 绑定）。
+//! 非 Unix 没有等价的可移植接口，返回 0。
 
+#[cfg(unix)]
 #[cfg(target_os = "macos")]
 const RUSAGE_UNIT_BYTES: u64 = 1;
+#[cfg(unix)]
 #[cfg(not(target_os = "macos"))]
 const RUSAGE_UNIT_BYTES: u64 = 1024;
 
+#[cfg(unix)]
 pub fn rss_bytes() -> u64 {
   #[cfg(target_os = "linux")]
   if let Some(bytes) = linux_resident_bytes() {
@@ -17,6 +21,13 @@ pub fn rss_bytes() -> u64 {
   max_rss_bytes()
 }
 
+/// Windows 第一阶段不支持：没有 `getrusage` 等价物，0 表示「未知」。
+#[cfg(not(unix))]
+pub fn rss_bytes() -> u64 {
+  0
+}
+
+#[cfg(unix)]
 #[cfg(target_os = "linux")]
 fn linux_resident_bytes() -> Option<u64> {
   let content = std::fs::read_to_string("/proc/self/statm").ok()?;
@@ -29,6 +40,7 @@ fn linux_resident_bytes() -> Option<u64> {
   Some(resident_pages * page_size as u64)
 }
 
+#[cfg(unix)]
 fn max_rss_bytes() -> u64 {
   let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
   if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
@@ -37,7 +49,7 @@ fn max_rss_bytes() -> u64 {
   (usage.ru_maxrss.max(0) as u64) * RUSAGE_UNIT_BYTES
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
   use super::*;
 
