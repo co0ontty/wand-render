@@ -82,7 +82,7 @@ jobs:
           token: ${{ secrets.RENDER_BIN_TOKEN }}
           path: render-bin
       - name: Update manifest and stage binaries
-        run: node scripts/update-manifest.js --bin-dir render-bin
+        run: node scripts/update-manifest.mjs --bin-dir render-bin
       - name: Push artifacts
         working-directory: render-bin
         run: |

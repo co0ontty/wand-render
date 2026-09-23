@@ -1,0 +1,9 @@
+{
+  "triple": "darwin-arm64",
+  "rustTarget": "aarch64-apple-darwin",
+  "version": "0.1.0",
+  "protocolVersion": 1,
+  "minServerVersion": "4.73.0",
+  "sha256": "977e170a3c4fa7355fee25500aa622f3670ca8ed1a45b6ddb05fc4cd37f1515e",
+  "size": 820336
+}

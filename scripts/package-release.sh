@@ -19,7 +19,9 @@ fi
 
 # 版本只有一个真源：workspace 的 Cargo.toml。tag 与它不一致时 CI 会在这里失败。
 VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-PROTOCOL_VERSION="$(grep -m1 'RENDER_PROTOCOL_VERSION' crates/wand-render-protocol/src/lib.rs | grep -o '[0-9]\+')"
+# 只认常量定义行：文件头注释里也出现了这个标识符，按标识符 grep 会先命中注释而拿到空值。
+# 必须锚到 `: u32 = `：宽松写法会先吃掉类型名 `u32` 里的 32，把协议版本解析成 32。
+PROTOCOL_VERSION="$(sed -n 's/^pub const RENDER_PROTOCOL_VERSION: *u32 *= *\([0-9][0-9]*\).*/\1/p' crates/wand-render-protocol/src/lib.rs | head -1)"
 MIN_SERVER_VERSION="$(sed -n 's/.*"minServerVersion": *"\([^"]*\)".*/\1/p' release.json)"
 if [ -z "$VERSION" ] || [ -z "$PROTOCOL_VERSION" ] || [ -z "$MIN_SERVER_VERSION" ]; then
   echo "cannot resolve version (crate=$VERSION protocol=$PROTOCOL_VERSION minServer=$MIN_SERVER_VERSION)" >&2
@@ -57,6 +59,18 @@ case "$RUN_VERSION" in
 esac
 case "$RUN_VERSION" in
   *stub*|*TODO*) echo "packaged binary looks like a stub: $RUN_VERSION" >&2; exit 1 ;;
+esac
+
+# 交叉校验三件事：二进制自报的协议版本等于源码常量；源码解析出的版本号合理；二进制不是 stub。
+# 解析错、忘了重新编译、二进制来自别的提交，都在这里暴露，而不是等 Server 启动时报 protocolMismatch。
+BINARY_PROTOCOL="$(printf '%s' "$RUN_VERSION" | sed -n 's/.*(protocol \([0-9][0-9]*\)).*/\1/p')"
+if [ "$BINARY_PROTOCOL" != "$PROTOCOL_VERSION" ]; then
+  echo "binary reports protocol=$BINARY_PROTOCOL but source declares $PROTOCOL_VERSION ($RUN_VERSION)" >&2
+  exit 1
+fi
+case "$PROTOCOL_VERSION" in
+  1|2|3|4|5|6|7|8|9|1[0-9]) ;;
+  *) echo "implausible protocol version parsed from source: $PROTOCOL_VERSION" >&2; exit 1 ;;
 esac
 
 SHA="$(shasum -a 256 "$OUT_DIR/wand-render" | awk '{print $1}')"

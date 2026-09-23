@@ -42,7 +42,9 @@ fn main() {
 fn run() -> Result<()> {
   match args::parse(std::env::args().skip(1)).map_err(|message| anyhow!(message))? {
     args::Command::Version => {
-      println!("wand-render {VERSION}");
+      // 带上协议版本：打包脚本据此断言「二进制自报的协议版本」与源码常量一致。
+      // 只报 crate 版本时，协议常量解析错误（例如把 `u32` 里的 32 当成版本号）无法被发现。
+      println!("wand-render {VERSION} (protocol {RENDER_PROTOCOL_VERSION})");
       return Ok(());
     }
     args::Command::Help => {
