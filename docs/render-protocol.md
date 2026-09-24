@@ -172,6 +172,16 @@ interface TerminalSnapshot {
 - **端口/实例隔离**：socket / token / pid / meta 全部按 config 路径派生；`-c /tmp/x/config.json` 得到独立 Render。
 - **disconnect（Server 侧）**：**只解绑**——关 socket、清 handle、保留 Render 与所有 PTY。
 - **single instance**：pid 活着但 socket 不可用 → 等待就绪而不是另起一个；协议版本不匹配 → 明确报错，**不做降级运行**。
+- **端点自愈（daemon 侧）**：socket 放在全局可写的临时目录（`/tmp`），会被系统/第三方的临时目录清理器
+  unlink。daemon 必须把端点当成可丢失的：每秒检查一次，文件不在了就 rebind（旧连接与 PTY 全部保留），
+  并且每 60s 摸一次自己那个 inode 的 mtime，降低被按年龄清理的概率。**换绑前必须比对 dev/ino**：
+  路径已被别人换成新端点时绝不 unlink、也不改它。
+- **崩溃自愈（Server 侧）**：daemon 被 kill / 崩溃后端点一并失效时，重连一万次都不会成功。
+  Server 在重连失败时判定「没有活着的 owner（pid 文件缺失或 pid 已死）+ 端点连不上（文件不存在，
+  或存在的那个没人 listen）」，然后 detached spawn 一个新 daemon 再重连。同一个 5s 窗口只 spawn 一次；
+  **只要有活着的 owner 就绝不 spawn**（继续等它自愈，见上一条 single instance）。
+- **收摊只删自己的东西**：daemon 退出时只删内容/身份还是自己写的 token / pid / meta，
+  避免升级期里两个 daemon 共存时，老进程把新进程的凭据删掉（那会让新 daemon 变成「活着但端点不可用」）。
 - **升级 Render 自身**：`shutdown { mode: "drain" }` 停止接受新会话，已退出会话释放，运行中会话保留；
   `mode: "now"` 杀掉所有 PTY 后退出（只在用户明确要求时使用）。
 

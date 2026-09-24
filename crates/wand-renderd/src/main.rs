@@ -134,7 +134,7 @@ fn serve(config_path: &Path) -> Result<()> {
   let server = RenderServer::new(
     Arc::clone(&hub),
     Arc::clone(&registry),
-    token,
+    token.clone(),
     shutdown_channel.0.clone(),
   );
 
@@ -154,7 +154,7 @@ fn serve(config_path: &Path) -> Result<()> {
   // 给 shutdown 响应与最后一个事件一点出场时间，然后收摊。
   std::thread::sleep(EXIT_FLUSH_DELAY);
   registry.stop_maintenance();
-  cleanup(&paths);
+  cleanup(&paths, &token, std::process::id());
   eprintln!("wand-render stopped ({mode:?})");
   Ok(())
 }
@@ -411,14 +411,32 @@ fn write_private(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
   Ok(())
 }
 
+/// 收摊时只删**自己拥有**的文件。
+///
+/// 升级期/僵尸期同一个 config 可能出现两个 daemon：老进程若无条件 unlink，会把新进程的
+/// token/pid/meta 一并删掉，新 daemon 随即变成「活着但凭据没了」，所有终端断联。
+/// socket 仍然照删 —— 真的被占时 bind 会 EADDRINUSE，而新 daemon 的 prepare_socket_path
+/// 会自己处理陈留的 socket 文件。
 #[cfg(unix)]
-fn cleanup(paths: &RenderPaths) {
-  for path in [
-    &paths.socket_path,
-    &paths.token_path,
-    &paths.pid_path,
-    &paths.meta_path,
-  ] {
+fn cleanup(paths: &RenderPaths, token: &str, pid: u32) {
+  let _ = std::fs::remove_file(&paths.socket_path);
+  remove_if_owned(&paths.token_path, |raw| raw.trim() == token);
+  remove_if_owned(&paths.pid_path, |raw| raw.trim() == pid.to_string());
+  remove_if_owned(&paths.meta_path, |raw| {
+    serde_json::from_str::<serde_json::Value>(raw)
+      .ok()
+      .and_then(|value| value.get("pid").and_then(serde_json::Value::as_u64))
+      == Some(u64::from(pid))
+  });
+}
+
+/// 内容还是本进程写的值才删（读不到或被别人改写都算「不是自己的」）。
+#[cfg(unix)]
+fn remove_if_owned(path: &Path, owned: impl Fn(&str) -> bool) {
+  let Ok(raw) = std::fs::read_to_string(path) else {
+    return;
+  };
+  if owned(&raw) {
     let _ = std::fs::remove_file(path);
   }
 }
@@ -489,6 +507,29 @@ mod tests {
       pid_path: dir.join(".render.pid"),
       meta_path: dir.join(".render.json"),
     }
+  }
+
+  /// 收摊只删自己的东西：别人（接替我们的新 daemon）写进去的 token/pid/meta 必须留着。
+  #[test]
+  fn cleanup_only_removes_files_this_process_owns() {
+    let dir = test_dir("cleanup-ownership");
+    let paths = test_paths(&dir);
+    std::fs::write(&paths.token_path, "someone-elses-token\n").expect("write token");
+    std::fs::write(&paths.pid_path, "999999\n").expect("write pid");
+    std::fs::write(&paths.meta_path, "{\"pid\":999999}\n").expect("write meta");
+    cleanup(&paths, "our-token", 4242);
+    assert!(paths.token_path.exists(), "a successor's token must survive our shutdown");
+    assert!(paths.pid_path.exists(), "a successor's pid must survive our shutdown");
+    assert!(paths.meta_path.exists(), "a successor's meta must survive our shutdown");
+
+    std::fs::write(&paths.token_path, "our-token\n").expect("write token");
+    std::fs::write(&paths.pid_path, "4242\n").expect("write pid");
+    std::fs::write(&paths.meta_path, "{\"pid\":4242}\n").expect("write meta");
+    cleanup(&paths, "our-token", 4242);
+    assert!(!paths.token_path.exists(), "our own token must be removed");
+    assert!(!paths.pid_path.exists(), "our own pid must be removed");
+    assert!(!paths.meta_path.exists(), "our own meta must be removed");
+    let _ = std::fs::remove_dir_all(&dir);
   }
 
   /// 活得着的 Render 必须拒绝启动而不是抢 socket。
