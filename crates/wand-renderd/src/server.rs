@@ -88,7 +88,7 @@ impl ClientHub {
       .lock()
       .unwrap_or_else(|poisoned| poisoned.into_inner())
       .push(Arc::clone(&conn));
-    spawn_writer(Arc::clone(&conn), receiver);
+    spawn_writer(&conn, receiver);
     conn
   }
 
@@ -165,16 +165,28 @@ impl ClientConn {
   }
 }
 
-fn spawn_writer(conn: Arc<ClientConn>, receiver: Receiver<Vec<u8>>) {
+/// 启动写线程。
+///
+/// 只持 `Weak<ClientConn>`：writer 线程若强引用 `ClientConn`，而 `ClientConn` 又持有
+/// 这条 channel 的 sender，就构成「recv 等 sender、sender 等自己」的引用环 —— 连接断开
+/// 后 `ClientConn` 永不释放，`UnixStream` 的 fd 与这个线程各泄漏一份。慢客户端反复
+/// 重连时 fd 会一路涨到 EMFILE，表现就是「终端连不上」。
+fn spawn_writer(conn: &Arc<ClientConn>, receiver: Receiver<Vec<u8>>) {
+  let weak = Arc::downgrade(conn);
   let _ = std::thread::Builder::new()
     .name(format!("wand-render-write-{}", conn.id))
     .spawn(move || {
       while let Ok(frame) = receiver.recv() {
+        // 最后一个强引用没了：连接已被释放，sender 也随之 drop。
+        let Some(conn) = weak.upgrade() else { break };
         if (&conn.stream).write_all(&frame).is_err() {
+          conn.close();
           break;
         }
       }
-      conn.close();
+      if let Some(conn) = weak.upgrade() {
+        conn.close();
+      }
     });
 }
 
@@ -627,6 +639,48 @@ mod tests {
     let value = server.list_response().expect("empty list");
     assert_eq!(value["sessions"], JsonValue::Array(Vec::new()));
     registry.stop_maintenance();
+  }
+
+  /// 回归：断开连接必须真正释放它的 fd 与写线程。
+  ///
+  /// 曾经的 writer 线程强引用 `ClientConn`，而 `ClientConn` 持着同一个 channel 的
+  /// sender —— 引用环让每条断开过的连接的 socket fd 与线程永久泄漏（线上 0.1.0 daemon
+  /// 25 小时累积 594 个 fd / 610 个线程，最终会打到 EMFILE 让新连接连不上）。
+  #[test]
+  fn disconnecting_releases_the_socket_fd_and_writer_thread() {
+    let hub = ClientHub::new();
+    let baseline = open_fd_count();
+    for _ in 0..32 {
+      let (server_side, client_side) = UnixStream::pair().expect("socketpair");
+      let conn = hub.connect(server_side);
+      hub.disconnect(&conn);
+      drop(conn);
+      drop(client_side);
+    }
+    let after = wait_for_fd_count_at_most(baseline + 2);
+    assert!(
+      after <= baseline + 2,
+      "disconnected clients leaked fds: baseline={baseline} after={after}"
+    );
+  }
+
+  /// 让 fd 数回落到上限以内（写线程退栈是异步的）；超时返回当时的值。
+  fn wait_for_fd_count_at_most(limit: usize) -> usize {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+      let count = open_fd_count();
+      if count <= limit || std::time::Instant::now() >= deadline {
+        return count;
+      }
+      std::thread::sleep(Duration::from_millis(20));
+    }
+  }
+
+  /// 进程当前打开的 fd 数（0..4096 里能 `fcntl(F_GETFD)` 命中的个数）。
+  fn open_fd_count() -> usize {
+    (0..4096)
+      .filter(|fd| unsafe { libc::fcntl(*fd, libc::F_GETFD) } != -1)
+      .count()
   }
 
   /// §9.5.2：uid 不符的连接必须在读到 token 之前就被关掉。
