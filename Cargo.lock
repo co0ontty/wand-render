@@ -354,7 +354,7 @@ dependencies = [
 
 [[package]]
 name = "wand-render"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -369,7 +369,7 @@ dependencies = [
 
 [[package]]
 name = "wand-render-protocol"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "wand-renderd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "libc",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "wand-structured-renderd"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "libc",

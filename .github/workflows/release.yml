@@ -209,6 +209,24 @@ jobs:
         run: |
           set -euo pipefail
           TAG="v$VERSION"
+          # 只在「触发 tag == v<Cargo 版本>」时发布。
+          #
+          # 否则会出事故：主仓库的 v4.x tag 一旦被误推到本仓库，这个 job 会把 VERSION 解析成
+          # Cargo 里的 0.1.x，于是 `gh release upload v0.1.x --clobber` 用别的 commit 的产物
+          # 覆盖掉同名 release（2026-09-24 的 v4.75.0 就这么把 v0.1.2 的产物换成了它自己那份，
+          # tag 与产物对不上）。跳过时给 ::warning:: + step summary，不静默。
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ] && [ "${GITHUB_REF_NAME:-}" != "$TAG" ]; then
+            echo "::warning::tag ${GITHUB_REF_NAME} does not match the packaged version $TAG; skipping publish (nothing was uploaded)"
+            {
+              echo "## 未发布：tag 与版本号不一致"
+              echo ""
+              echo "- 触发 tag：\`${GITHUB_REF_NAME}\`"
+              echo "- Cargo 里的版本：\`$TAG\`"
+              echo ""
+              echo "主仓库的 \`v4.x\` tag 被推到本仓库时会走到这里。发产物请用 \`v$VERSION\` 这个 tag。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
           # 每个平台一个 tar.gz + 顶层 manifest/checksums：
           # wand-render-bin 的 sync workflow 就按这个结构下载与校验。
           mkdir -p dist/assets
