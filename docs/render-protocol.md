@@ -144,6 +144,7 @@ macOS 为 `getrusage` 报告的峰值）。两者不保证相等。
 - 每个 session 内单调自增，从 1 开始；`incarnationId` 改变时从 1 重新开始。
 - `attach(afterSeq)` 返回 `chunks` 中 `seq > afterSeq` 的部分作为补洞数据；Server 侧据此重建。
 - 事件 `data` 与 `chunks` 用同一套 seq。
+- `data` 是不透明的字节流分片，不承诺对应一次 OS `read`。实现可以先合并短读再分配一个连续 seq；不得先分配多个 seq 再只发送最后一个（这会被客户端识别为丢片）。空闲按键回显立即发送；连续输出可用有界、首读固定截止时间的短窗口合并，不能一直等待静默，也不能跨 session / incarnation。该优化不改变 v1 字段与重放语义。
 
 ## 5. TerminalSnapshot（语义要求）
 

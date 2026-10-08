@@ -35,7 +35,93 @@ use crate::snapshot::{self, DecModeTracker};
 use crate::utf8::IncrementalUtf8Decoder;
 
 /// 读取线程读取缓冲大小：足够大以减少系统调用，又不至于让单帧内存过胖。
-const READ_BUFFER_BYTES: usize = 32 * 1024;
+const READ_BUFFER_BYTES: usize = 64 * 1024;
+const READ_BATCH_WINDOW: Duration = Duration::from_millis(4);
+const READ_BURST_GAP: Duration = Duration::from_millis(8);
+
+#[cfg(unix)]
+type ReadPollFd = std::os::fd::OwnedFd;
+#[cfg(not(unix))]
+type ReadPollFd = ();
+
+/// Keep a separate descriptor alive for polling, even if retire drops master.
+#[cfg(unix)]
+fn clone_poll_fd(master: &dyn MasterPty) -> std::io::Result<Option<ReadPollFd>> {
+  use std::os::fd::BorrowedFd;
+  master
+    .as_raw_fd()
+    .map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned())
+    .transpose()
+}
+
+#[cfg(not(unix))]
+fn clone_poll_fd(_master: &dyn MasterPty) -> std::io::Result<Option<ReadPollFd>> {
+  Ok(None)
+}
+
+#[cfg(unix)]
+fn readable_before(fd: Option<&ReadPollFd>, remaining: Duration) -> std::io::Result<bool> {
+  use std::os::fd::AsRawFd;
+  let Some(fd) = fd else { return Ok(false) };
+  let mut poll = libc::pollfd {
+    fd: fd.as_raw_fd(),
+    events: libc::POLLIN,
+    revents: 0,
+  };
+  let timeout = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+  let result = unsafe { libc::poll(&mut poll, 1, timeout) };
+  if result < 0 {
+    return Err(std::io::Error::last_os_error());
+  }
+  if poll.revents & libc::POLLNVAL != 0 {
+    return Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidInput,
+      "invalid PTY poll fd",
+    ));
+  }
+  Ok(result > 0 && poll.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
+}
+
+#[cfg(not(unix))]
+fn readable_before(_fd: Option<&ReadPollFd>, _remaining: Duration) -> std::io::Result<bool> {
+  Ok(false)
+}
+
+/// Coalesce burst reads before assigning a journal/event sequence. The deadline
+/// starts on the first read, never on the last, so continuous output cannot
+/// starve. Idle keystroke echo uses coalesce=false and has no batching delay.
+fn read_batch(
+  reader: &mut dyn Read,
+  buffer: &mut [u8],
+  fd: Option<&ReadPollFd>,
+  coalesce: bool,
+) -> std::io::Result<usize> {
+  let mut size = reader.read(buffer)?;
+  if size == 0 || !coalesce {
+    return Ok(size);
+  }
+  let deadline = Instant::now() + READ_BATCH_WINDOW;
+  while size < buffer.len() {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+      break;
+    }
+    match readable_before(fd, remaining) {
+      Ok(false) => break,
+      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+      Err(_) => break,
+      Ok(true) => {}
+    }
+    match reader.read(&mut buffer[size..]) {
+      Ok(0) => break,
+      Ok(read) => size += read,
+      Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+      // Preserve bytes already read before EOF/EIO; the next read closes out.
+      Err(_) => break,
+    }
+  }
+  Ok(size)
+}
 /// 退出后等读取线程排空残余输出的上限。
 const READER_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 /// 防止异常 create/resize 请求让 VT 网格一次分配数十 GB。
@@ -62,7 +148,9 @@ pub(crate) fn validate_size(cols: u16, rows: u16) -> Result<(), RenderError> {
 /// 取锁时把「中毒」当成正常状态：会话数据本身没有跨会话不变量，
 /// 一个 panic 过的线程不该让其它会话的 attach 全部失败。
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-  mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+  mutex
+    .lock()
+    .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 struct Inner {
@@ -242,6 +330,15 @@ impl Session {
         return Err(RenderError::Spawn(format!("pty reader failed: {error}")));
       }
     };
+    let poll_fd = match clone_poll_fd(pair.master.as_ref()) {
+      Ok(fd) => fd,
+      Err(error) => {
+        force_kill(child.process_id().unwrap_or(0));
+        return Err(RenderError::Spawn(format!(
+          "pty poll descriptor failed: {error}"
+        )));
+      }
+    };
     let writer = match pair.master.take_writer() {
       Ok(writer) => writer,
       Err(error) => {
@@ -301,7 +398,7 @@ impl Session {
     let reader_session = Arc::clone(&session);
     let read_thread = std::thread::Builder::new()
       .name(format!("wand-render-read-{}", session.session_id))
-      .spawn(move || reader_session.read_loop(reader));
+      .spawn(move || reader_session.read_loop(reader, poll_fd));
     if let Err(error) = read_thread {
       force_kill(pid);
       return Err(RenderError::Spawn(format!("reader thread failed: {error}")));
@@ -469,16 +566,19 @@ impl Session {
     }
   }
 
-  fn read_loop(self: Arc<Self>, mut reader: Box<dyn Read + Send>) {
+  fn read_loop(self: Arc<Self>, mut reader: Box<dyn Read + Send>, poll_fd: Option<ReadPollFd>) {
     let mut decoder = IncrementalUtf8Decoder::new();
     let mut buffer = vec![0u8; READ_BUFFER_BYTES];
+    let mut last_emit_at: Option<Instant> = None;
     loop {
-      match reader.read(&mut buffer) {
+      let coalesce = last_emit_at.is_some_and(|last| last.elapsed() < READ_BURST_GAP);
+      match read_batch(reader.as_mut(), &mut buffer, poll_fd.as_ref(), coalesce) {
         Ok(0) => break,
         Ok(read) => {
           let text = decoder.push(&buffer[..read]);
           if !text.is_empty() {
             self.append(&text);
+            last_emit_at = Some(Instant::now());
           }
         }
         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -708,7 +808,10 @@ mod tests {
     assert_eq!(decode_wait_status(0).exit_code, Some(0));
     assert_eq!(decode_wait_status(0).signal, None);
     assert_eq!(decode_wait_status(3 << 8).exit_code, Some(3));
-    assert_eq!(decode_wait_status(libc::SIGKILL).signal, Some(libc::SIGKILL));
+    assert_eq!(
+      decode_wait_status(libc::SIGKILL).signal,
+      Some(libc::SIGKILL)
+    );
     assert_eq!(decode_wait_status(libc::SIGKILL).exit_code, None);
     assert_eq!(decode_wait_status(0x7f).exit_code, None);
     assert_eq!(decode_wait_status(0x7f).signal, None);
@@ -726,9 +829,18 @@ mod tests {
   fn terminal_geometry_rejects_pathological_allocations() {
     assert!(validate_size(80, 24).is_ok());
     assert!(validate_size(1000, 500).is_ok());
-    assert!(matches!(validate_size(0, 24), Err(RenderError::BadRequest(_))));
-    assert!(matches!(validate_size(1025, 24), Err(RenderError::BadRequest(_))));
-    assert!(matches!(validate_size(1024, 500), Err(RenderError::BadRequest(_))));
+    assert!(matches!(
+      validate_size(0, 24),
+      Err(RenderError::BadRequest(_))
+    ));
+    assert!(matches!(
+      validate_size(1025, 24),
+      Err(RenderError::BadRequest(_))
+    ));
+    assert!(matches!(
+      validate_size(1024, 500),
+      Err(RenderError::BadRequest(_))
+    ));
   }
 
   #[test]
@@ -764,6 +876,82 @@ mod tests {
     assert!(baseline_bytes >= 80 * 24 * 2 * std::mem::size_of::<vt100::Cell>() as u64);
     inner.push_pending("some pending output");
     assert!(inner.live_bytes() > baseline_bytes);
+  }
+
+  #[cfg(unix)]
+  struct ShortReads(std::os::unix::net::UnixStream, usize);
+
+  #[cfg(unix)]
+  impl Read for ShortReads {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+      let length = self.1.min(buffer.len());
+      self.0.read(&mut buffer[..length])
+    }
+  }
+
+  #[test]
+  #[cfg(unix)]
+  fn burst_reads_are_bounded_and_keep_all_bytes_through_eof() {
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let poll_fd: ReadPollFd = reader.try_clone().unwrap().into();
+    let expected = "tool output 0123456789\\r\\n".repeat(20_000).into_bytes();
+    let payload = expected.clone();
+    let thread = std::thread::spawn(move || writer.write_all(&payload).unwrap());
+    let mut reader = ShortReads(reader, 32);
+    let mut buffer = vec![0; READ_BUFFER_BYTES];
+    let mut actual = Vec::new();
+    let mut batches = 0;
+    loop {
+      let read = read_batch(&mut reader, &mut buffer, Some(&poll_fd), true).unwrap();
+      if read == 0 {
+        break;
+      }
+      assert!(read <= READ_BUFFER_BYTES);
+      actual.extend_from_slice(&buffer[..read]);
+      batches += 1;
+    }
+    thread.join().unwrap();
+    assert_eq!(actual, expected);
+    assert!(
+      batches < expected.len() / 32 / 10,
+      "short reads must not each become an IPC event"
+    );
+  }
+
+  #[test]
+  #[cfg(unix)]
+  fn idle_echo_does_not_wait_for_or_drain_a_batch() {
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let poll_fd: ReadPollFd = reader.try_clone().unwrap().into();
+    writer.write_all(b"abcdef").unwrap();
+    let mut reader = ShortReads(reader, 2);
+    let mut buffer = vec![0; READ_BUFFER_BYTES];
+    let read = read_batch(&mut reader, &mut buffer, Some(&poll_fd), false).unwrap();
+    assert_eq!(&buffer[..read], b"ab");
+  }
+
+  #[test]
+  #[cfg(unix)]
+  fn batching_still_decodes_split_utf8_and_discards_incomplete_eof() {
+    let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let poll_fd: ReadPollFd = reader.try_clone().unwrap().into();
+    writer.write_all("虎a虎b虎c".as_bytes()).unwrap();
+    writer.write_all(&[0xe8]).unwrap();
+    drop(writer);
+    let mut reader = ShortReads(reader, 1);
+    let mut buffer = vec![0; 5];
+    let mut decoder = IncrementalUtf8Decoder::new();
+    let mut text = String::new();
+    loop {
+      let read = read_batch(&mut reader, &mut buffer, Some(&poll_fd), true).unwrap();
+      if read == 0 {
+        break;
+      }
+      text.push_str(&decoder.push(&buffer[..read]));
+    }
+    decoder.discard_tail();
+    assert_eq!(text, "虎a虎b虎c");
+    assert_eq!(decoder.pending_bytes(), 0);
   }
 
   #[test]

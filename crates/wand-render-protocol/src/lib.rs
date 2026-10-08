@@ -74,6 +74,8 @@ pub enum ErrorCode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "event", rename_all = "camelCase")]
 pub enum Event {
+    // One journal sequence per emitted chunk, not per OS read. Coalescing must
+    // happen before assigning seq, so clients still observe a contiguous stream.
     #[serde(rename_all = "camelCase")]
     Data {
         session_id: String,
