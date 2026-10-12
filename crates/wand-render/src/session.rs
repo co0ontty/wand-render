@@ -13,6 +13,7 @@
 
 use std::io::{Read, Write};
 use std::path::Path;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
@@ -38,6 +39,9 @@ use crate::utf8::IncrementalUtf8Decoder;
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const READ_BATCH_WINDOW: Duration = Duration::from_millis(4);
 const READ_BURST_GAP: Duration = Duration::from_millis(8);
+/// A live slave can briefly close/reopen its descriptors. Do not spin or
+/// permanently abandon its output on a transient EOF/EIO/WouldBlock.
+const READ_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 #[cfg(unix)]
 type ReadPollFd = std::os::fd::OwnedFd;
@@ -162,6 +166,9 @@ struct Inner {
   output: TextWindow,
   chunks: ChunkWindow,
   parser: Parser,
+  /// VT is a cache, not the transport. An invalid model must never stop reads
+  /// or be advertised as a valid (but stale) reconnect snapshot.
+  screen_valid: bool,
   /// 上一次 checkpoint 拍下的基线屏幕。**冻结**：它只反映 checkpoint 那一刻的屏幕，
   /// 之后的操作走 `pending`（协议要求「先写 data，再按序重放 pending」）。
   baseline: TerminalSnapshot,
@@ -187,23 +194,47 @@ impl Inner {
   /// 关键点：基线取当前屏幕，所以之前累积的 pending 不能再交出去（它们已经在屏幕里了，
   /// 重放会写两遍）；同时基线之后新到的操作会继续进 pending，保证
   /// 「baseline + pending == 当前屏幕」在任何时刻都成立 —— 这是重连不丢输出的前提。
-  fn checkpoint(&mut self) {
-    let (baseline, history_rows) =
-      snapshot::build_baseline_with_history(self.parser.screen(), self.modes.autowrap());
-    self.baseline = baseline;
-    if !self.parser.screen().alternate_screen() {
-      self.scrollback_rows = history_rows;
-    }
-    self.pending.clear();
-    self.pending_chars = 0;
-    self.snapshot_dirty = false;
+  fn checkpoint(&mut self) -> bool {
+    self.update_screen(|inner| {
+      let (baseline, history_rows) =
+        snapshot::build_baseline_with_history(inner.parser.screen(), inner.modes.autowrap());
+      inner.baseline = baseline;
+      if !inner.parser.screen().alternate_screen() {
+        inner.scrollback_rows = history_rows;
+      }
+      inner.pending.clear();
+      inner.pending_chars = 0;
+      inner.snapshot_dirty = false;
+    })
   }
 
-  /// 供读取的快照：冻结基线 + 基线之后的操作。
-  fn snapshot_for_read(&self) -> TerminalSnapshot {
+  /// Returns true only on a new fault. Do not retry a partially mutated VT
+  /// cache: keep forwarding/journaling exact PTY bytes and expose no snapshot.
+  /// The client already supports null snapshots by replaying raw output.
+  fn update_screen(&mut self, update: impl FnOnce(&mut Self)) -> bool {
+    if !self.screen_valid {
+      return false;
+    }
+    if catch_unwind(AssertUnwindSafe(|| update(self))).is_ok() {
+      return false;
+    }
+    self.screen_valid = false;
+    self.snapshot_dirty = false;
+    self.pending.clear();
+    self.pending_chars = 0;
+    self.baseline.data.clear();
+    self.baseline.pending.clear();
+    true
+  }
+
+  /// 供读取的快照：冻结基线 + 基线之后的操作；失效缓存明确返回 None。
+  fn snapshot_for_read(&self) -> Option<TerminalSnapshot> {
+    if !self.screen_valid {
+      return None;
+    }
     let mut snapshot = self.baseline.clone();
     snapshot.pending = self.pending.clone();
-    snapshot
+    Some(snapshot)
   }
 
   fn push_pending(&mut self, data: &str) {
@@ -363,6 +394,7 @@ impl Session {
       output: TextWindow::new(PTY_OUTPUT_MAX_CHARS),
       chunks: ChunkWindow::new(PTY_OUTPUT_MAX_CHARS),
       parser: Parser::new(params.rows, params.cols, SCROLLBACK_LINES),
+      screen_valid: true,
       baseline: TerminalSnapshot {
         version: snapshot::VERSION,
         data: String::new(),
@@ -445,7 +477,7 @@ impl Session {
           seq,
         })
         .collect(),
-      terminal_snapshot: Some(inner.snapshot_for_read()),
+      terminal_snapshot: inner.snapshot_for_read(),
       launch_marker_token: self.launch_marker_token.clone(),
     }
   }
@@ -477,7 +509,7 @@ impl Session {
 
   pub fn resize(&self, cols: u16, rows: u16) -> Result<(), RenderError> {
     validate_size(cols, rows)?;
-    {
+    let screen_failed = {
       let mut inner = lock(&self.state);
       if inner.status != SessionStatus::Running {
         return Err(RenderError::Conflict(format!(
@@ -489,10 +521,15 @@ impl Session {
       inner.rows = rows;
       inner.max_cols_seen = inner.max_cols_seen.max(cols);
       inner.max_rows_seen = inner.max_rows_seen.max(rows);
-      inner.parser.screen_mut().set_size(rows, cols);
-      inner.pending.push(PendingOp::Resize { cols, rows });
-      // 尺寸变化会让旧基线失效：下一次静默窗口一定会重算。
-      inner.snapshot_dirty = true;
+      inner.update_screen(|inner| {
+        inner.parser.screen_mut().set_size(rows, cols);
+        inner.pending.push(PendingOp::Resize { cols, rows });
+        // 尺寸变化会让旧基线失效：下一次静默窗口一定会重算。
+        inner.snapshot_dirty = true;
+      })
+    };
+    if screen_failed {
+      crate::diagnostics::record("screen-resize-panic", Some(&self.session_id));
     }
     let master = lock(&self.master);
     if let Some(master) = master.as_ref() {
@@ -561,8 +598,10 @@ impl Session {
       .last_write_at
       .map(|last| now.saturating_duration_since(last) >= Duration::from_millis(SNAPSHOT_QUIET_MS))
       .unwrap_or(true);
-    if quiet {
-      inner.checkpoint();
+    let screen_failed = quiet && inner.checkpoint();
+    drop(inner);
+    if screen_failed {
+      crate::diagnostics::record("screen-checkpoint-panic", Some(&self.session_id));
     }
   }
 
@@ -573,6 +612,9 @@ impl Session {
     loop {
       let coalesce = last_emit_at.is_some_and(|last| last.elapsed() < READ_BURST_GAP);
       match read_batch(reader.as_mut(), &mut buffer, poll_fd.as_ref(), coalesce) {
+        Ok(0) if self.is_running() && !self.retired.load(Ordering::SeqCst) => {
+          std::thread::sleep(READ_RETRY_DELAY);
+        }
         Ok(0) => break,
         Ok(read) => {
           let text = decoder.push(&buffer[..read]);
@@ -582,8 +624,20 @@ impl Session {
           }
         }
         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-        // EIO / EOF：子进程已退出，读取线程自然收尾。
-        Err(_) => break,
+        Err(error) if retryable_read_error(&error)
+          && self.is_running() && !self.retired.load(Ordering::SeqCst) => {
+          std::thread::sleep(READ_RETRY_DELAY);
+        }
+        Err(error) => {
+          // EIO is the normal Unix PTY end condition, but unexpected failures
+          // must leave a bounded diagnostic rather than disappearing silently.
+          if self.is_running() && !self.retired.load(Ordering::SeqCst) {
+            crate::diagnostics::record(
+              &format!("pty-read-error:{:?}", error.kind()), Some(&self.session_id),
+            );
+          }
+          break;
+        },
       }
     }
     // 协议要求：会话结束时丢弃不完整尾部，绝不产出 U+FFFD。
@@ -602,12 +656,13 @@ impl Session {
     }
     // 先让读取线程把残余输出吐完，再广播 exit，保住「data 先于 exit」的顺序。
     self.wait_reader(READER_DRAIN_TIMEOUT);
-    {
+    let screen_failed = {
       let mut inner = lock(&self.state);
       // 退出后屏幕不会再变：把 pending 落进基线，让 attach 直接拿到终态屏幕。
-      if inner.snapshot_dirty {
-        inner.checkpoint();
-      }
+      inner.snapshot_dirty && inner.checkpoint()
+    };
+    if screen_failed {
+      crate::diagnostics::record("screen-exit-checkpoint-panic", Some(&self.session_id));
     }
     // 已 forget 的会话不再广播：Server 侧已经把它当不存在了。
     if self.retired.load(Ordering::SeqCst) {
@@ -645,7 +700,7 @@ impl Session {
     if self.retired.load(Ordering::SeqCst) {
       return;
     }
-    let seq = {
+    let (seq, screen_failed) = {
       let mut inner = lock(&self.state);
       inner.seq += 1;
       let seq = inner.seq;
@@ -656,20 +711,26 @@ impl Session {
         Some(stripper) => stripper.consume(data),
         None => data.to_string(),
       };
+      let mut screen_failed = false;
       if !visible.is_empty() {
         inner.output.push(&visible);
-        inner.modes.scan(visible.as_bytes());
-        inner.parser.process(visible.as_bytes());
-        inner.push_pending(&visible);
-        inner.last_write_at = Some(Instant::now());
-        inner.snapshot_dirty = true;
+        screen_failed = inner.update_screen(|inner| {
+          inner.modes.scan(visible.as_bytes());
+          inner.parser.process(visible.as_bytes());
+          inner.push_pending(&visible);
+          inner.last_write_at = Some(Instant::now());
+          inner.snapshot_dirty = true;
+        });
         if inner.pending_over_budget() {
           // pending 太大：不等静默窗口，立刻重建基线（legacy 的同名阈值）。
-          inner.checkpoint();
+          screen_failed |= inner.checkpoint();
         }
       }
-      seq
+      (seq, screen_failed)
     };
+    if screen_failed {
+      crate::diagnostics::record("screen-output-panic", Some(&self.session_id));
+    }
     self.sink.publish(Event::Data {
       session_id: self.session_id.clone(),
       incarnation_id: self.incarnation_id.clone(),
@@ -677,6 +738,17 @@ impl Session {
       seq,
     });
   }
+}
+
+fn retryable_read_error(error: &std::io::Error) -> bool {
+  if error.kind() == std::io::ErrorKind::WouldBlock {
+    return true;
+  }
+  #[cfg(unix)]
+  if error.raw_os_error() == Some(libc::EIO) {
+    return true;
+  }
+  false
 }
 
 /// 投递信号：只有确认子进程是它自己进程组的组长时才用 `-pid`（forkpty 路径下
@@ -843,8 +915,7 @@ mod tests {
     ));
   }
 
-  #[test]
-  fn live_bytes_covers_screen_and_pending_memory() {
+  fn test_inner() -> Inner {
     let mut inner = Inner {
       status: SessionStatus::Running,
       exit_code: None,
@@ -854,6 +925,7 @@ mod tests {
       output: TextWindow::new(PTY_OUTPUT_MAX_CHARS),
       chunks: ChunkWindow::new(PTY_OUTPUT_MAX_CHARS),
       parser: Parser::new(24, 80, SCROLLBACK_LINES),
+      screen_valid: true,
       baseline: TerminalSnapshot {
         version: snapshot::VERSION,
         data: String::new(),
@@ -872,10 +944,85 @@ mod tests {
       modes: DecModeTracker::new(),
     };
     inner.checkpoint();
+    inner
+  }
+
+  #[test]
+  fn screen_fault_discards_stale_cache_without_retrying_it() {
+    let mut inner = test_inner();
+    assert!(inner.snapshot_for_read().is_some());
+    assert!(inner.update_screen(|inner| {
+      inner.push_pending("partially updated cache");
+      panic!("synthetic screen failure");
+    }));
+    assert!(inner.snapshot_for_read().is_none());
+    assert!(!inner.snapshot_dirty);
+    assert!(inner.pending.is_empty());
+    assert!(!inner.update_screen(|_| panic!("disabled cache must not be retried")));
+    assert!(!inner.checkpoint());
+  }
+
+  #[test]
+  fn live_bytes_covers_screen_and_pending_memory() {
+    let mut inner = test_inner();
     let baseline_bytes = inner.live_bytes();
     assert!(baseline_bytes >= 80 * 24 * 2 * std::mem::size_of::<vt100::Cell>() as u64);
     inner.push_pending("some pending output");
     assert!(inner.live_bytes() > baseline_bytes);
+  }
+
+  #[test]
+  #[cfg(unix)]
+  fn reader_retries_temporary_eof_eio_and_would_block_until_child_exits() {
+    use std::collections::VecDeque;
+    struct ScriptedRead {
+      session: Arc<Session>,
+      steps: VecDeque<std::io::Result<Vec<u8>>>,
+    }
+    impl Read for ScriptedRead {
+      fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self.steps.pop_front() {
+          Some(result) => {
+            let bytes = result?;
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+          }
+          None => {
+            lock(&self.session.state).status = SessionStatus::Exited;
+            Ok(0)
+          }
+        }
+      }
+    }
+    let session = Arc::new(Session {
+      session_id: "retry-reader".into(),
+      incarnation_id: "test".into(),
+      pid: 0,
+      launch_marker_token: None,
+      retired: AtomicBool::new(false),
+      state: Mutex::new(test_inner()),
+      writer: Mutex::new(None),
+      master: Mutex::new(None),
+      reader_done: (Mutex::new(false), Condvar::new()),
+      sink: Arc::new(crate::sink::NullSink),
+    });
+    let reader = ScriptedRead {
+      session: Arc::clone(&session),
+      steps: VecDeque::from([
+        Ok(b"before".to_vec()),
+        Err(std::io::Error::from(std::io::ErrorKind::Interrupted)),
+        Ok(Vec::new()),
+        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        Ok(b"after".to_vec()),
+      ]),
+    };
+    Arc::clone(&session).read_loop(Box::new(reader), None);
+    let state = session.state(0);
+    assert_eq!(state.output, "beforeafter");
+    assert_eq!(state.seq, 2);
+    assert!(*lock(&session.reader_done.0));
+    assert!(!retryable_read_error(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
   }
 
   #[cfg(unix)]

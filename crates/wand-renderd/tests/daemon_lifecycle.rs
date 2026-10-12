@@ -38,6 +38,10 @@ struct Daemon {
 
 impl Daemon {
   fn start(dir: &Path) -> Self {
+    Self::start_with_stderr(dir, Stdio::inherit())
+  }
+
+  fn start_with_stderr(dir: &Path, stderr: Stdio) -> Self {
     std::fs::create_dir_all(dir).expect("config dir");
     let config = dir.join("config.json");
     // 让 config 真的存在：两侧的路径派生都会走 realpath，测试与守护进程一致。
@@ -48,8 +52,7 @@ impl Daemon {
       .arg(&config)
       .stdin(Stdio::null())
       .stdout(Stdio::null())
-      // 继承 stderr：失败时测试输出里能直接看到守护进程自己的诊断。
-      .stderr(Stdio::inherit())
+      .stderr(stderr)
       .spawn()
       .expect("spawn wand-render");
     let (socket, token) = connect_when_ready(&mut child, &paths);
@@ -266,6 +269,40 @@ fn temp_dir(tag: &str) -> PathBuf {
     std::process::id(),
     COUNTER.fetch_add(1, Ordering::Relaxed)
   ))
+}
+
+#[test]
+fn screen_panic_keeps_wire_output_live_and_records_private_bounded_diagnostics() {
+  let mut daemon = Daemon::start_with_stderr(&temp_dir("screen-fault"), Stdio::null());
+  let mut params = create_params("fault");
+  params["cols"] = json!(1);
+  params["args"] = json!(["-c", "stty -echo; printf 'PRIVATE-FIXTURE-PAYLOAD中'; read answer; printf 'AFTER-INPUT'"]);
+  assert!(daemon.request("createOrAttach", params).ok);
+  assert!(daemon.consume_until(|_, events| events.iter().any(|event| matches!(
+    event, Event::Data { session_id, data, .. } if session_id == "fault" && data.contains('中')
+  ))));
+  let attached = daemon.request("attach", json!({"sessionId": "fault"}));
+  assert!(attached.ok);
+  let state = attached.result.unwrap()["state"].clone();
+  assert!(state["terminalSnapshot"].is_null());
+  assert!(state["output"].as_str().unwrap().contains('中'));
+  assert!(daemon.request("write", json!({"sessionId": "fault", "data": "continue\r"})).ok);
+  assert!(daemon.consume_until(|_, events| events.iter().any(|event| matches!(
+    event, Event::Exit { session_id, exit_code: Some(0), .. } if session_id == "fault"
+  ))));
+  assert!(daemon.events.iter().any(|event| matches!(
+    event, Event::Data { session_id, data, .. } if session_id == "fault" && data.contains("AFTER-INPUT")
+  )));
+  let log_path = daemon.paths.meta_path.with_extension("errors.jsonl");
+  let log = std::fs::read_to_string(&log_path).expect("fault survives detached stdio");
+  assert!(log.contains("screen-output-panic"));
+  assert!(log.contains("panic:"));
+  assert!(!log.contains("PRIVATE-FIXTURE-PAYLOAD"));
+  assert!(!log.contains(&daemon.token));
+  use std::os::unix::fs::PermissionsExt;
+  assert_eq!(std::fs::metadata(log_path).unwrap().permissions().mode() & 0o777, 0o600);
+  assert!(daemon.request("shutdown", json!({"mode": "drain"})).ok);
+  assert!(daemon.wait_for_exit(Duration::from_secs(10)));
 }
 
 /// §9.3：drain 之后进程与 PTY 都活着、attach 仍返回 running、新会话被拒；

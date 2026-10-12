@@ -5,6 +5,7 @@
 //! 负责 socket、鉴权与方法分发，它只通过 [`registry::RenderRegistry`] 与本 crate 交互。
 
 pub mod bounds;
+pub mod diagnostics;
 pub mod error;
 pub mod marker;
 pub mod paths;

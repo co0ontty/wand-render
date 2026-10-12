@@ -91,6 +91,14 @@ docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/tmp/target rust:1.98
 6. 主仓库 `npm run build` 把 `render-bin/v<version>/<triple>/*` 校验 sha256 后 stage 到
    `dist/native/<triple>/`（`--all`，覆盖全部平台），随 npm 包一起发布。
 
+## 输出与屏幕缓存的故障边界
+
+- PTY 原始字节、连续 seq 与 journal 是真源；VT 屏幕模型只是重连用的缓存。
+- `vt100` 的本地补丁修复缩窄窗口时截断双格字符留下无效单元格的问题，来源、许可证与移除条件见 [`vendor/vt100/WAND-PATCH.md`](vendor/vt100/WAND-PATCH.md)。普通 resize 仍保留可用、等价的屏幕快照。
+- 若屏幕处理、resize 或 checkpoint 意外 panic，只禁用该会话的屏幕缓存；后续输出/输入、其他会话及退出通知继续工作，不重新执行用户命令。既有可空 `terminalSnapshot` 返回 `null`，消费方按原契约回退原始输出重放，不返回旧屏幕冒充最新屏幕。
+- 活跃子进程暂时关闭/重开 slave 描述符产生的 EOF/EIO/WouldBlock 以短延迟重试，子进程真实退出后结束；不把缓存错误当进程退出。
+- 守护进程把故障元数据写入配置目录的 `.render-<suffix>.errors.jsonl`（0600，256KiB 轮转、最多保留上一份）。只记录时间、PID、会话/线程标识和错误类别/源码位置，不记录终端原文、命令、环境、凭据或 panic payload；因此即使 detached stdio 是 `/dev/null` 也能查到故障位置。
+
 ## 与 Server 的版本握手
 
 `manifest.json` 记录每个版本的 `protocolVersion` 与 `minServerVersion`。Server 启动时：

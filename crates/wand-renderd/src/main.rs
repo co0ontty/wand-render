@@ -128,6 +128,10 @@ fn serve(config_path: &Path) -> Result<()> {
   });
   write_private(&paths.meta_path, format!("{meta}\n").as_bytes(), 0o644)?;
 
+  // Detached stdout/stderr may be /dev/null. Keep bounded fault metadata
+  // independently, without logging PTY content or panic payloads.
+  wand_render::diagnostics::install(paths.meta_path.with_extension("errors.jsonl"));
+
   let hub = ClientHub::new();
   let shutdown_channel = install_shutdown_signals()?;
   let registry = RenderRegistry::new(VERSION, HubSink::new(Arc::clone(&hub)));

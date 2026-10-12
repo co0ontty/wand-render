@@ -226,6 +226,53 @@ fn resize_is_applied_to_the_child() {
   registry.forget("resize");
 }
 
+/// A malformed/unrepresentable screen must not strand the reader, journal,
+/// subsequent input, other PTYs, or the final exit event.
+#[test]
+fn screen_failure_degrades_snapshot_without_stopping_pty_transport() {
+  let (registry, sink) = registry();
+  let script = r"stty -echo; printf '\344\270\255'; read answer; printf 'AFTER-INPUT'; exit 0";
+  registry.create_or_attach(&params("screen-fault", &["-c", script], 1, 3)).expect("create");
+  // vt100 cannot represent a two-cell glyph in a one-column grid. The
+  // resulting parser panic is deliberately exercised through a real reader.
+  assert!(wait_until(WAIT, || sink.data_text("screen-fault").contains('中')),
+    "the faulting chunk must still be emitted");
+  let before = registry.attach("screen-fault", 0).expect("attach after fault");
+  assert!(before.terminal_snapshot.is_none(), "never return a stale screen");
+  registry.resize("screen-fault", 80, 24).expect("resize remains usable");
+  registry.write("screen-fault", "continue\r").expect("input remains usable");
+  assert_eq!(wait_for_exit(&sink, "screen-fault"), (Some(0), None));
+  let after = registry.attach("screen-fault", 0).expect("final attach");
+  assert!(after.output.contains("AFTER-INPUT"));
+  assert!(after.terminal_snapshot.is_none());
+  assert!(after.seq > before.seq);
+  let streamed = sink.data_text("screen-fault");
+  assert_eq!(after.chunks.iter().map(|chunk| chunk.data.as_str()).collect::<String>(), streamed);
+  let seqs = sink.data_seqs("screen-fault");
+  assert!(seqs.windows(2).all(|pair| pair[1] == pair[0] + 1));
+  assert!(sink.last_data_index("screen-fault").unwrap() < sink.exit_index("screen-fault").unwrap());
+  registry.create_or_attach(&params("after-fault", &["-c", "printf other-pty"], 80, 24)).expect("other PTY");
+  wait_for_exit(&sink, "after-fault");
+  assert!(registry.attach("after-fault", 0).unwrap().terminal_snapshot.is_some());
+  registry.forget("screen-fault");
+  registry.forget("after-fault");
+}
+
+#[test]
+fn clipped_wide_redraw_keeps_real_reader_alive_and_snapshot_valid() {
+  let (registry, sink) = registry();
+  let script = r"stty -echo; printf '\033[?1049h\033[1;9H中'; read answer; printf '\033[1;9HxOK'; exit 0";
+  registry.create_or_attach(&params("wide-resize", &["-c", script], 10, 3)).expect("create");
+  assert!(wait_until(WAIT, || sink.data_text("wide-resize").contains('中')));
+  registry.resize("wide-resize", 9, 3).expect("shrink through glyph");
+  registry.write("wide-resize", "continue\r").expect("redraw input");
+  assert_eq!(wait_for_exit(&sink, "wide-resize"), (Some(0), None));
+  let state = registry.attach("wide-resize", 0).unwrap();
+  assert!(sink.data_text("wide-resize").contains("xOK"));
+  assert!(state.terminal_snapshot.is_some(), "a normal resize must not degrade the screen");
+  registry.forget("wide-resize");
+}
+
 /// seq 单调，`attach(afterSeq)` 只返回 seq > afterSeq 的补洞数据。
 #[test]
 fn seq_is_monotonic_and_attach_filters_by_after_seq() {

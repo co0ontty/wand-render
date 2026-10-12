@@ -300,9 +300,6 @@ enum DecScan {
 
 /// 解析 `ESC [ ? p1 ; p2 ... h|l`。
 fn parse_dec_private_mode(bytes: &[u8]) -> DecScan {
-  if bytes.len() > MAX_SEQUENCE_BYTES {
-    return DecScan::NotAMode;
-  }
   if bytes.len() < 2 {
     return DecScan::Incomplete;
   }
@@ -319,7 +316,7 @@ fn parse_dec_private_mode(bytes: &[u8]) -> DecScan {
   let mut mode: u32 = 0;
   let mut seen_digit = false;
   let mut matches = false;
-  while index < bytes.len() {
+  while index < bytes.len() && index < MAX_SEQUENCE_BYTES {
     match bytes[index] {
       b'0'..=b'9' => {
         seen_digit = true;
@@ -349,7 +346,11 @@ fn parse_dec_private_mode(bytes: &[u8]) -> DecScan {
       _ => return DecScan::NotAMode,
     }
   }
-  DecScan::Incomplete
+  if index >= MAX_SEQUENCE_BYTES {
+    DecScan::NotAMode
+  } else {
+    DecScan::Incomplete
+  }
 }
 
 #[cfg(test)]
@@ -614,6 +615,20 @@ mod tests {
     assert!(!tracker.autowrap());
     tracker.scan(b"\x1b[?25l\x1b[?7h");
     assert!(tracker.autowrap());
+  }
+
+  #[test]
+  fn dec_mode_limit_applies_to_the_sequence_not_following_text() {
+    let mut tracker = DecModeTracker::new();
+    tracker.scan(format!("\x1b[?7l{}", "x".repeat(4096)).as_bytes());
+    assert!(!tracker.autowrap());
+    tracker.scan(b"\x1b[?7");
+    tracker.scan(format!("h{}", "x".repeat(4096)).as_bytes());
+    assert!(tracker.autowrap());
+    tracker.scan(format!("\x1b[?{}", "1".repeat(100)).as_bytes());
+    assert!(tracker.tail.len() <= MAX_SEQUENCE_BYTES);
+    tracker.scan(b"\x1b[?7l");
+    assert!(!tracker.autowrap());
   }
 
   #[test]
